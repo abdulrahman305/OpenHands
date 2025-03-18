@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -eo pipefail
 
 source "evaluation/utils/version_control.sh"
@@ -53,7 +53,7 @@ COMMAND="poetry run python evaluation/benchmarks/toolqa/run_infer.py \
   --max-iterations 30 \
   --dataset $DATASET \
   --hardness $HARDNESS \
-  --wolfram_alpha_appid $WOLFRAM_APPID\
+  --wolfram-alpha-appid $WOLFRAM_APPID\
   --data-split validation \
   --eval-num-workers $NUM_WORKERS \
   --eval-note ${OPENHANDS_VERSION}_${LEVELS}"

@@ -8,18 +8,20 @@ from evaluation.integration_tests.tests.base import BaseIntegrationTest, TestRes
 from evaluation.utils.shared import (
     EvalMetadata,
     EvalOutput,
-    codeact_user_response,
+    get_default_sandbox_config_for_eval,
     make_metadata,
     prepare_dataset,
     reset_logger_for_multiprocessing,
     run_evaluation,
     update_llm_config_for_completions_logging,
 )
+from evaluation.utils.shared import (
+    codeact_user_response as fake_user_response,
+)
 from openhands.controller.state.state import State
 from openhands.core.config import (
     AgentConfig,
     AppConfig,
-    SandboxConfig,
     get_llm_config_arg,
     parse_arguments,
 )
@@ -31,7 +33,8 @@ from openhands.runtime.base import Runtime
 from openhands.utils.async_utils import call_async_from_sync
 
 FAKE_RESPONSES = {
-    'CodeActAgent': codeact_user_response,
+    'CodeActAgent': fake_user_response,
+    'VisualBrowsingAgent': fake_user_response,
 }
 
 
@@ -39,23 +42,14 @@ def get_config(
     metadata: EvalMetadata,
     instance_id: str,
 ) -> AppConfig:
+    sandbox_config = get_default_sandbox_config_for_eval()
+    sandbox_config.platform = 'linux/amd64'
     config = AppConfig(
         default_agent=metadata.agent_class,
         run_as_openhands=False,
-        runtime=os.environ.get('RUNTIME', 'eventstream'),
+        runtime=os.environ.get('RUNTIME', 'docker'),
         max_iterations=metadata.max_iterations,
-        sandbox=SandboxConfig(
-            # use default base_container_image
-            enable_auto_lint=True,
-            use_host_network=False,
-            timeout=300,
-            # Add platform to the sandbox config to solve issue 4401
-            platform='linux/amd64',
-            api_key=os.environ.get('ALLHANDS_API_KEY', None),
-            remote_runtime_api_url=os.environ.get('SANDBOX_REMOTE_RUNTIME_API_URL'),
-            keep_runtime_alive=False,
-            remote_runtime_init_timeout=3600,
-        ),
+        sandbox=sandbox_config,
         # do not mount workspace
         workspace_base=None,
         workspace_mount_path=None,
@@ -219,7 +213,7 @@ if __name__ == '__main__':
 
     df = pd.read_json(output_file, lines=True, orient='records')
 
-    # record success and reason for failure for the final report
+    # record success and reason
     df['success'] = df['test_result'].apply(lambda x: x['success'])
     df['reason'] = df['test_result'].apply(lambda x: x['reason'])
     logger.info('-' * 100)
@@ -234,15 +228,27 @@ if __name__ == '__main__':
     logger.info('-' * 100)
 
     # record cost for each instance, with 3 decimal places
-    df['cost'] = df['metrics'].apply(lambda x: round(x['accumulated_cost'], 3))
+    # we sum up all the "costs" from the metrics array
+    df['cost'] = df['metrics'].apply(
+        lambda m: round(sum(c['cost'] for c in m['costs']), 3)
+        if m and 'costs' in m
+        else 0.0
+    )
+
+    # capture the top-level error if present, per instance
+    df['error_message'] = df.get('error', None)
+
     logger.info(f'Total cost: USD {df["cost"].sum():.2f}')
 
     report_file = os.path.join(metadata.eval_output_dir, 'report.md')
     with open(report_file, 'w') as f:
         f.write(
-            f'Success rate: {df["success"].mean():.2%} ({df["success"].sum()}/{len(df)})\n'
+            f'Success rate: {df["success"].mean():.2%}'
+            f' ({df["success"].sum()}/{len(df)})\n'
         )
         f.write(f'\nTotal cost: USD {df["cost"].sum():.2f}\n')
         f.write(
-            df[['instance_id', 'success', 'reason', 'cost']].to_markdown(index=False)
+            df[
+                ['instance_id', 'success', 'reason', 'cost', 'error_message']
+            ].to_markdown(index=False)
         )

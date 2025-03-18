@@ -3,12 +3,12 @@ This guide is for people working on OpenHands and editing the source code.
 If you wish to contribute your changes, check out the [CONTRIBUTING.md](https://github.com/All-Hands-AI/OpenHands/blob/main/CONTRIBUTING.md) on how to clone and setup the project initially before moving on.
 Otherwise, you can clone the OpenHands project directly.
 
-## Start the server for development
+## Start the Server for Development
 ### 1. Requirements
-* Linux, Mac OS, or [WSL on Windows](https://learn.microsoft.com/en-us/windows/wsl/install)  [Ubuntu <= 22.04]
+* Linux, Mac OS, or [WSL on Windows](https://learn.microsoft.com/en-us/windows/wsl/install)  [Ubuntu >= 22.04]
 * [Docker](https://docs.docker.com/engine/install/) (For those on MacOS, make sure to allow the default Docker socket to be used from advanced settings!)
 * [Python](https://www.python.org/downloads/) = 3.12
-* [NodeJS](https://nodejs.org/en/download/package-manager) >= 18.17.1
+* [NodeJS](https://nodejs.org/en/download/package-manager) >= 20.x
 * [Poetry](https://python-poetry.org/docs/#installing-with-the-official-installer) >= 1.8
 * OS-specific dependencies:
   - Ubuntu: build-essential => `sudo apt-get install build-essential`
@@ -58,7 +58,7 @@ See [our documentation](https://docs.all-hands.dev/modules/usage/llms) for recom
 
 ### 4. Running the application
 #### Option A: Run the Full Application
-Once the setup is complete, launching OpenHands is as simple as running a single command. This command starts both the backend and frontend servers seamlessly, allowing you to interact with OpenHands:
+Once the setup is complete, this command starts both the backend and frontend servers, allowing you to interact with OpenHands:
 ```bash
 make run
 ```
@@ -75,11 +75,11 @@ make run
     ```
 
 ### 6. LLM Debugging
-If you encounter any issues with the Language Model (LM) or you're simply curious, you can inspect the actual LLM prompts and responses. To do so, export DEBUG=1 in the environment and restart the backend.
-OpenHands will then log the prompts and responses in the logs/llm/CURRENT_DATE directory, allowing you to identify the causes.
+If you encounter any issues with the Language Model (LM) or you're simply curious, export DEBUG=1 in the environment and restart the backend.
+OpenHands will log the prompts and responses in the logs/llm/CURRENT_DATE directory, allowing you to identify the causes.
 
 ### 7. Help
-Need assistance or information on available targets and commands? The help command provides all the necessary guidance to ensure a smooth experience with OpenHands.
+Need help or info on available targets and commands? Use the help command for all the guidance you need with OpenHands.
 ```bash
 make help
  ```
@@ -93,14 +93,14 @@ poetry run pytest ./tests/unit/test_*.py
 ```
 
 ### 9. Add or update dependency
-1. Add your dependency in `pyproject.toml` or use `poetry add xxx`
-2. Update the poetry.lock file via `poetry lock --no-update`
+1. Add your dependency in `pyproject.toml` or use `poetry add xxx`.
+2. Update the poetry.lock file via `poetry lock --no-update`.
 
 ### 9. Use existing Docker image
 To reduce build time (e.g., if no changes were made to the client-runtime component), you can use an existing Docker container image by
 setting the SANDBOX_RUNTIME_CONTAINER_IMAGE environment variable to the desired Docker image.
 
-Example: `export SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/all-hands-ai/runtime:0.15-nikolaik`
+Example: `export SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/all-hands-ai/runtime:0.29-nikolaik`
 
 ## Develop inside Docker container
 
@@ -110,7 +110,7 @@ TL;DR
 make docker-dev
 ```
 
-See more details [here](./containers/dev/README.md)
+See more details [here](./containers/dev/README.md).
 
 If you are just interested in running `OpenHands` without installing all the required tools on your host.
 
@@ -126,3 +126,19 @@ cd ./containers/dev
 ```
 
 You do need [Docker](https://docs.docker.com/engine/install/) installed on your host though.
+
+## Key Documentation Resources
+Here's a guide to the important documentation files in the repository:
+
+- `/README.md`: Main project overview, features, and basic setup instructions
+- `/Development.md` (this file): Comprehensive guide for developers working on OpenHands
+- `/CONTRIBUTING.md`: Guidelines for contributing to the project, including code style and PR process
+- `/docs/DOC_STYLE_GUIDE.md`: Standards for writing and maintaining project documentation
+- `/openhands/README.md`: Details about the backend Python implementation
+- `/frontend/README.md`: Frontend React application setup and development guide
+- `/containers/README.md`: Information about Docker containers and deployment
+- `/tests/unit/README.md`: Guide to writing and running unit tests
+- `/evaluation/README.md`: Documentation for the evaluation framework and benchmarks
+- `/microagents/README.md`: Information about the microagents architecture and implementation
+- `/openhands/server/README.md`: Server implementation details and API documentation
+- `/openhands/runtime/README.md`: Documentation for the runtime environment and execution model

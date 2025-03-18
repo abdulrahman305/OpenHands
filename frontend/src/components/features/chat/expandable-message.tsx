@@ -2,12 +2,16 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Link } from "react-router";
 import { code } from "../markdown/code";
 import { ol, ul } from "../markdown/list";
 import ArrowUp from "#/icons/angle-up-solid.svg?react";
 import ArrowDown from "#/icons/angle-down-solid.svg?react";
 import CheckCircle from "#/icons/check-circle-solid.svg?react";
 import XCircle from "#/icons/x-circle-solid.svg?react";
+import { cn } from "#/utils/utils";
+import { useConfig } from "#/hooks/query/use-config";
+import { BILLING_SETTINGS } from "#/utils/feature-flags";
 
 interface ExpandableMessageProps {
   id?: string;
@@ -22,6 +26,7 @@ export function ExpandableMessage({
   type,
   success,
 }: ExpandableMessageProps) {
+  const { data: config } = useConfig();
   const { t, i18n } = useTranslation();
   const [showDetails, setShowDetails] = useState(true);
   const [headline, setHeadline] = useState("");
@@ -35,57 +40,103 @@ export function ExpandableMessage({
     }
   }, [id, message, i18n.language]);
 
-  const arrowClasses = "h-4 w-4 ml-2 inline fill-neutral-300";
   const statusIconClasses = "h-4 w-4 ml-2 inline";
 
-  return (
-    <div className="flex gap-2 items-center justify-between border-l-2 border-neutral-300 pl-2 my-2 py-2">
-      <div className="text-sm leading-4 flex flex-col gap-2 max-w-full">
-        {headline && (
-          <p className="text-neutral-300 font-bold">
-            {headline}
-            <button
-              type="button"
-              onClick={() => setShowDetails(!showDetails)}
-              className="cursor-pointer text-left"
-            >
-              {showDetails ? (
-                <ArrowUp className={arrowClasses} />
-              ) : (
-                <ArrowDown className={arrowClasses} />
-              )}
-            </button>
-          </p>
-        )}
-        {showDetails && (
-          <Markdown
-            className="text-sm overflow-auto"
-            components={{
-              code,
-              ul,
-              ol,
-            }}
-            remarkPlugins={[remarkGfm]}
+  if (
+    BILLING_SETTINGS() &&
+    config?.APP_MODE === "saas" &&
+    id === "STATUS$ERROR_LLM_OUT_OF_CREDITS"
+  ) {
+    return (
+      <div className="flex gap-2 items-center justify-start border-l-2 pl-2 my-2 py-2 border-danger">
+        <div className="text-sm w-full">
+          <div className="font-bold text-danger">
+            {t("STATUS$ERROR_LLM_OUT_OF_CREDITS")}
+          </div>
+          <Link
+            className="mt-2 mb-2 w-full h-10 rounded flex items-center justify-center gap-2 bg-primary text-[#0D0F11]"
+            to="/settings/billing"
           >
-            {details}
-          </Markdown>
-        )}
+            {t("BILLING$CLICK_TO_TOP_UP")}
+          </Link>
+        </div>
       </div>
-      {type === "action" && success !== undefined && (
-        <div className="flex-shrink-0">
-          {success ? (
-            <CheckCircle
-              data-testid="status-icon"
-              className={`${statusIconClasses} fill-success`}
-            />
-          ) : (
-            <XCircle
-              data-testid="status-icon"
-              className={`${statusIconClasses} fill-danger`}
-            />
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "flex gap-2 items-center justify-start border-l-2 pl-2 my-2 py-2",
+        type === "error" ? "border-danger" : "border-neutral-300",
+      )}
+    >
+      <div className="text-sm w-full">
+        <div className="flex flex-row justify-between items-center w-full">
+          <span
+            className={cn(
+              headline ? "font-bold" : "",
+              type === "error" ? "text-danger" : "text-neutral-300",
+            )}
+          >
+            {headline && (
+              <>
+                {headline}
+                <button
+                  type="button"
+                  onClick={() => setShowDetails(!showDetails)}
+                  className="cursor-pointer text-left"
+                >
+                  {showDetails ? (
+                    <ArrowUp
+                      className={cn(
+                        "h-4 w-4 ml-2 inline",
+                        type === "error" ? "fill-danger" : "fill-neutral-300",
+                      )}
+                    />
+                  ) : (
+                    <ArrowDown
+                      className={cn(
+                        "h-4 w-4 ml-2 inline",
+                        type === "error" ? "fill-danger" : "fill-neutral-300",
+                      )}
+                    />
+                  )}
+                </button>
+              </>
+            )}
+          </span>
+          {type === "action" && success !== undefined && (
+            <span className="flex-shrink-0">
+              {success ? (
+                <CheckCircle
+                  data-testid="status-icon"
+                  className={cn(statusIconClasses, "fill-success")}
+                />
+              ) : (
+                <XCircle
+                  data-testid="status-icon"
+                  className={cn(statusIconClasses, "fill-danger")}
+                />
+              )}
+            </span>
           )}
         </div>
-      )}
+        {(!headline || showDetails) && (
+          <div className="text-sm overflow-auto">
+            <Markdown
+              components={{
+                code,
+                ul,
+                ol,
+              }}
+              remarkPlugins={[remarkGfm]}
+            >
+              {details}
+            </Markdown>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -eo pipefail
 
 source "evaluation/utils/version_control.sh"
@@ -25,13 +25,8 @@ if [ -z "$AGENT" ]; then
 fi
 
 if [ -z "$MAX_ITER" ]; then
-  echo "MAX_ITER not specified, use default 100"
-  MAX_ITER=100
-fi
-
-if [ -z "$USE_INSTANCE_IMAGE" ]; then
-  echo "USE_INSTANCE_IMAGE not specified, use default true"
-  USE_INSTANCE_IMAGE=true
+  echo "MAX_ITER not specified, use default 60"
+  MAX_ITER=60
 fi
 
 if [ -z "$RUN_WITH_BROWSING" ]; then
@@ -50,8 +45,6 @@ if [ -z "$SPLIT" ]; then
   SPLIT="test"
 fi
 
-export USE_INSTANCE_IMAGE=$USE_INSTANCE_IMAGE
-echo "USE_INSTANCE_IMAGE: $USE_INSTANCE_IMAGE"
 export RUN_WITH_BROWSING=$RUN_WITH_BROWSING
 echo "RUN_WITH_BROWSING: $RUN_WITH_BROWSING"
 
@@ -108,7 +101,14 @@ if [ -z "$N_RUNS" ]; then
   echo "N_RUNS not specified, use default $N_RUNS"
 fi
 
+# Skip runs if the run number is in the SKIP_RUNS list
+# read from env variable SKIP_RUNS as a comma separated list of run numbers
+SKIP_RUNS=(${SKIP_RUNS//,/ })
 for i in $(seq 1 $N_RUNS); do
+  if [[ " ${SKIP_RUNS[@]} " =~ " $i " ]]; then
+    echo "Skipping run $i"
+    continue
+  fi
   current_eval_note="$EVAL_NOTE-run_$i"
   echo "EVAL_NOTE: $current_eval_note"
   run_eval $current_eval_note

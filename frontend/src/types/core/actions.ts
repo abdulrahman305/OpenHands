@@ -24,7 +24,7 @@ export interface AssistantMessageAction
   extends OpenHandsActionEvent<"message"> {
   source: "agent";
   args: {
-    content: string;
+    thought: string;
     image_urls: string[] | null;
     wait_for_response: boolean;
   };
@@ -41,9 +41,18 @@ export interface IPythonAction extends OpenHandsActionEvent<"run_ipython"> {
   };
 }
 
+export interface ThinkAction extends OpenHandsActionEvent<"think"> {
+  source: "agent";
+  args: {
+    thought: string;
+  };
+}
+
 export interface FinishAction extends OpenHandsActionEvent<"finish"> {
   source: "agent";
   args: {
+    final_thought: string;
+    task_completed: "success" | "failure" | "partial";
     outputs: Record<string, unknown>;
     thought: string;
   };
@@ -78,32 +87,14 @@ export interface BrowseInteractiveAction
   };
 }
 
-export interface AddTaskAction extends OpenHandsActionEvent<"add_task"> {
-  source: "agent";
-  timeout: number;
-  args: {
-    parent: string;
-    goal: string;
-    subtasks: unknown[];
-    thought: string;
-  };
-}
-
-export interface ModifyTaskAction extends OpenHandsActionEvent<"modify_task"> {
-  source: "agent";
-  timeout: number;
-  args: {
-    task_id: string;
-    state: string;
-    thought: string;
-  };
-}
-
 export interface FileReadAction extends OpenHandsActionEvent<"read"> {
   source: "agent";
   args: {
     path: string;
     thought: string;
+    security_risk: ActionSecurityRisk | null;
+    impl_source?: string;
+    view_range?: number[] | null;
   };
 }
 
@@ -113,6 +104,25 @@ export interface FileWriteAction extends OpenHandsActionEvent<"write"> {
     path: string;
     content: string;
     thought: string;
+  };
+}
+
+export interface FileEditAction extends OpenHandsActionEvent<"edit"> {
+  source: "agent";
+  args: {
+    path: string;
+    command?: string;
+    file_text?: string | null;
+    view_range?: number[] | null;
+    old_str?: string | null;
+    new_str?: string | null;
+    insert_line?: number | null;
+    content?: string;
+    start?: number;
+    end?: number;
+    thought: string;
+    security_risk: ActionSecurityRisk | null;
+    impl_source?: string;
   };
 }
 
@@ -128,12 +138,12 @@ export type OpenHandsAction =
   | AssistantMessageAction
   | CommandAction
   | IPythonAction
+  | ThinkAction
   | FinishAction
   | DelegateAction
   | BrowseAction
   | BrowseInteractiveAction
   | FileReadAction
+  | FileEditAction
   | FileWriteAction
-  | AddTaskAction
-  | ModifyTaskAction
   | RejectAction;

@@ -14,6 +14,7 @@ from jinja2 import Environment, FileSystemLoader
 
 import openhands
 from openhands import __version__ as oh_version
+from openhands.core.exceptions import AgentRuntimeBuildError
 from openhands.core.logger import openhands_logger as logger
 from openhands.runtime.builder import DockerRuntimeBuilder, RuntimeBuilder
 
@@ -68,7 +69,6 @@ def get_runtime_image_repo_and_tag(base_image: str) -> tuple[str, str]:
     Returns:
     - tuple[str, str]: The Docker repo and tag of the Docker image
     """
-
     if get_runtime_image_repo() in base_image:
         logger.debug(
             f'The provided image [{base_image}] is already a valid runtime image.\n'
@@ -114,6 +114,7 @@ def build_runtime_image(
     extra_build_args: List[str] | None = None,
 ) -> str:
     """Prepares the final docker build folder.
+
     If dry_run is False, it will also build the OpenHands runtime Docker image using the docker build folder.
 
     Parameters:
@@ -348,7 +349,7 @@ def _build_sandbox_image(
     platform: str | None = None,
     extra_build_args: List[str] | None = None,
 ):
-    """Build and tag the sandbox image. The image will be tagged with all tags that do not yet exist"""
+    """Build and tag the sandbox image. The image will be tagged with all tags that do not yet exist."""
     names = [
         f'{runtime_image_repo}:{source_tag}',
         f'{runtime_image_repo}:{lock_tag}',
@@ -364,7 +365,7 @@ def _build_sandbox_image(
         extra_build_args=extra_build_args,
     )
     if not image_name:
-        raise RuntimeError(f'Build failed for image {names}')
+        raise AgentRuntimeBuildError(f'Build failed for image {names}')
 
     return image_name
 

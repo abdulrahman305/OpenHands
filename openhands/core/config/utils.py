@@ -2,30 +2,44 @@ import argparse
 import os
 import pathlib
 import platform
-from dataclasses import is_dataclass
+import sys
+from ast import literal_eval
 from types import UnionType
 from typing import Any, MutableMapping, get_args, get_origin
+from uuid import uuid4
 
 import toml
 from dotenv import load_dotenv
+from pydantic import BaseModel, SecretStr, ValidationError
 
+from openhands import __version__
 from openhands.core import logger
 from openhands.core.config.agent_config import AgentConfig
 from openhands.core.config.app_config import AppConfig
+from openhands.core.config.condenser_config import condenser_config_from_toml_section
 from openhands.core.config.config_utils import (
     OH_DEFAULT_AGENT,
     OH_MAX_ITERATIONS,
 )
+from openhands.core.config.extended_config import ExtendedConfig
 from openhands.core.config.llm_config import LLMConfig
 from openhands.core.config.sandbox_config import SandboxConfig
 from openhands.core.config.security_config import SecurityConfig
+from openhands.storage import get_file_store
+from openhands.storage.files import FileStore
 
+JWT_SECRET = '.jwt_secret'
 load_dotenv()
 
 
-def load_from_env(cfg: AppConfig, env_or_toml_dict: dict | MutableMapping[str, str]):
-    """Reads the env-style vars and sets config attributes based on env vars or a config.toml dict.
-    Compatibility with vars like LLM_BASE_URL, AGENT_MEMORY_ENABLED, SANDBOX_TIMEOUT and others.
+def load_from_env(
+    cfg: AppConfig, env_or_toml_dict: dict | MutableMapping[str, str]
+) -> None:
+    """Sets config attributes from environment variables or TOML dictionary.
+
+    Reads environment-style variables and updates the config attributes accordingly.
+    Supports configuration of LLM settings (e.g., LLM_BASE_URL), agent settings
+    (e.g., AGENT_MEMORY_ENABLED), sandbox settings (e.g., SANDBOX_TIMEOUT), and more.
 
     Args:
         cfg: The AppConfig object to set attributes on.
@@ -38,17 +52,19 @@ def load_from_env(cfg: AppConfig, env_or_toml_dict: dict | MutableMapping[str, s
         return next((t for t in types if t is not type(None)), None)
 
     # helper function to set attributes based on env vars
-    def set_attr_from_env(sub_config: Any, prefix=''):
-        """Set attributes of a config dataclass based on environment variables."""
-        for field_name, field_type in sub_config.__annotations__.items():
+    def set_attr_from_env(sub_config: BaseModel, prefix='') -> None:
+        """Set attributes of a config model based on environment variables."""
+        for field_name, field_info in sub_config.model_fields.items():
+            field_value = getattr(sub_config, field_name)
+            field_type = field_info.annotation
+
             # compute the expected env var name from the prefix and field name
             # e.g. LLM_BASE_URL
             env_var_name = (prefix + field_name).upper()
 
-            if is_dataclass(field_type):
-                # nested dataclass
-                nested_sub_config = getattr(sub_config, field_name)
-                set_attr_from_env(nested_sub_config, prefix=field_name + '_')
+            if isinstance(field_value, BaseModel):
+                set_attr_from_env(field_value, prefix=field_name + '_')
+
             elif env_var_name in env_or_toml_dict:
                 # convert the env var to the correct type and set it
                 value = env_or_toml_dict[env_var_name]
@@ -65,6 +81,9 @@ def load_from_env(cfg: AppConfig, env_or_toml_dict: dict | MutableMapping[str, s
                     # Attempt to cast the env var to type hinted in the dataclass
                     if field_type is bool:
                         cast_value = str(value).lower() in ['true', '1']
+                    # parse dicts like SANDBOX_RUNTIME_STARTUP_ENV_VARS
+                    elif get_origin(field_type) is dict:
+                        cast_value = literal_eval(value)
                     else:
                         cast_value = field_type(value)
                     setattr(sub_config, field_name, cast_value)
@@ -84,12 +103,15 @@ def load_from_env(cfg: AppConfig, env_or_toml_dict: dict | MutableMapping[str, s
     set_attr_from_env(default_agent_config, 'AGENT_')
 
 
-def load_from_toml(cfg: AppConfig, toml_file: str = 'config.toml'):
+def load_from_toml(cfg: AppConfig, toml_file: str = 'config.toml') -> None:
     """Load the config from the toml file. Supports both styles of config vars.
 
     Args:
         cfg: The AppConfig object to update attributes of.
         toml_file: The path to the toml file. Defaults to 'config.toml'.
+
+    See Also:
+    - config.template.toml for the full list of config options.
     """
     # try to read the config.toml file into the config object
     try:
@@ -100,99 +122,149 @@ def load_from_toml(cfg: AppConfig, toml_file: str = 'config.toml'):
     except toml.TomlDecodeError as e:
         logger.openhands_logger.warning(
             f'Cannot parse config from toml, toml values have not been applied.\nError: {e}',
-            exc_info=False,
         )
         return
 
-    # if there was an exception or core is not in the toml, try to use the old-style toml
+    # Check for the [core] section
     if 'core' not in toml_config:
-        # re-use the env loader to set the config from env-style vars
-        load_from_env(cfg, toml_config)
-        return
-
-    core_config = toml_config['core']
-
-    # load llm configs and agent configs
-    for key, value in toml_config.items():
-        if isinstance(value, dict):
-            try:
-                if key is not None and key.lower() == 'agent':
-                    logger.openhands_logger.debug(
-                        'Attempt to load default agent config from config toml'
-                    )
-                    non_dict_fields = {
-                        k: v for k, v in value.items() if not isinstance(v, dict)
-                    }
-                    agent_config = AgentConfig(**non_dict_fields)
-                    cfg.set_agent_config(agent_config, 'agent')
-                    for nested_key, nested_value in value.items():
-                        if isinstance(nested_value, dict):
-                            logger.openhands_logger.debug(
-                                f'Attempt to load group {nested_key} from config toml as agent config'
-                            )
-                            agent_config = AgentConfig(**nested_value)
-                            cfg.set_agent_config(agent_config, nested_key)
-                elif key is not None and key.lower() == 'llm':
-                    logger.openhands_logger.debug(
-                        'Attempt to load default LLM config from config toml'
-                    )
-                    llm_config = LLMConfig.from_dict(value)
-                    cfg.set_llm_config(llm_config, 'llm')
-                    for nested_key, nested_value in value.items():
-                        if isinstance(nested_value, dict):
-                            logger.openhands_logger.debug(
-                                f'Attempt to load group {nested_key} from config toml as llm config'
-                            )
-                            llm_config = LLMConfig.from_dict(nested_value)
-                            cfg.set_llm_config(llm_config, nested_key)
-                elif key is not None and key.lower() == 'security':
-                    logger.openhands_logger.debug(
-                        'Attempt to load security config from config toml'
-                    )
-                    security_config = SecurityConfig.from_dict(value)
-                    cfg.security = security_config
-                elif not key.startswith('sandbox') and key.lower() != 'core':
-                    logger.openhands_logger.warning(
-                        f'Unknown key in {toml_file}: "{key}"'
-                    )
-            except (TypeError, KeyError) as e:
-                logger.openhands_logger.warning(
-                    f'Cannot parse config from toml, toml values have not been applied.\n Error: {e}',
-                    exc_info=False,
-                )
-        else:
-            logger.openhands_logger.warning(f'Unknown key in {toml_file}: "{key}')
-
-    try:
-        # set sandbox config from the toml file
-        sandbox_config = cfg.sandbox
-
-        # migrate old sandbox configs from [core] section to sandbox config
-        keys_to_migrate = [key for key in core_config if key.startswith('sandbox_')]
-        for key in keys_to_migrate:
-            new_key = key.replace('sandbox_', '')
-            if new_key in sandbox_config.__annotations__:
-                # read the key in sandbox and remove it from core
-                setattr(sandbox_config, new_key, core_config.pop(key))
-            else:
-                logger.openhands_logger.warning(f'Unknown sandbox config: {key}')
-
-        # the new style values override the old style values
-        if 'sandbox' in toml_config:
-            sandbox_config = SandboxConfig(**toml_config['sandbox'])
-
-        # update the config object with the new values
-        cfg.sandbox = sandbox_config
-        for key, value in core_config.items():
-            if hasattr(cfg, key):
-                setattr(cfg, key, value)
-            else:
-                logger.openhands_logger.warning(f'Unknown core config key: {key}')
-    except (TypeError, KeyError) as e:
         logger.openhands_logger.warning(
-            f'Cannot parse config from toml, toml values have not been applied.\nError: {e}',
-            exc_info=False,
+            f'No [core] section found in {toml_file}. Core settings will use defaults.'
         )
+        core_config = {}
+    else:
+        core_config = toml_config['core']
+
+    # Process core section if present
+    for key, value in core_config.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+        else:
+            logger.openhands_logger.warning(
+                f'Unknown config key "{key}" in [core] section'
+            )
+
+    # Process agent section if present
+    if 'agent' in toml_config:
+        try:
+            agent_mapping = AgentConfig.from_toml_section(toml_config['agent'])
+            for agent_key, agent_conf in agent_mapping.items():
+                cfg.set_agent_config(agent_conf, agent_key)
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [agent] config from toml, values have not been applied.\nError: {e}'
+            )
+
+    # Process llm section if present
+    if 'llm' in toml_config:
+        try:
+            llm_mapping = LLMConfig.from_toml_section(toml_config['llm'])
+            for llm_key, llm_conf in llm_mapping.items():
+                cfg.set_llm_config(llm_conf, llm_key)
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [llm] config from toml, values have not been applied.\nError: {e}'
+            )
+
+    # Process security section if present
+    if 'security' in toml_config:
+        try:
+            security_mapping = SecurityConfig.from_toml_section(toml_config['security'])
+            # We only use the base security config for now
+            if 'security' in security_mapping:
+                cfg.security = security_mapping['security']
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [security] config from toml, values have not been applied.\nError: {e}'
+            )
+        except ValueError:
+            # Re-raise ValueError from SecurityConfig.from_toml_section
+            raise ValueError('Error in [security] section in config.toml')
+
+    # Process sandbox section if present
+    if 'sandbox' in toml_config:
+        try:
+            sandbox_mapping = SandboxConfig.from_toml_section(toml_config['sandbox'])
+            # We only use the base sandbox config for now
+            if 'sandbox' in sandbox_mapping:
+                cfg.sandbox = sandbox_mapping['sandbox']
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [sandbox] config from toml, values have not been applied.\nError: {e}'
+            )
+        except ValueError:
+            # Re-raise ValueError from SandboxConfig.from_toml_section
+            raise ValueError('Error in [sandbox] section in config.toml')
+
+    # Process condenser section if present
+    if 'condenser' in toml_config:
+        try:
+            # Pass the LLM configs to the condenser config parser
+            condenser_mapping = condenser_config_from_toml_section(
+                toml_config['condenser'], cfg.llms
+            )
+            # Assign the default condenser configuration to the default agent configuration
+            if 'condenser' in condenser_mapping:
+                # Get the default agent config and assign the condenser config to it
+                default_agent_config = cfg.get_agent_config()
+                default_agent_config.condenser = condenser_mapping['condenser']
+                logger.openhands_logger.debug(
+                    'Default condenser configuration loaded from config toml and assigned to default agent'
+                )
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [condenser] config from toml, values have not been applied.\nError: {e}'
+            )
+    # If no condenser section is in toml but enable_default_condenser is True,
+    # set LLMSummarizingCondenserConfig as default
+    elif cfg.enable_default_condenser:
+        from openhands.core.config.condenser_config import LLMSummarizingCondenserConfig
+
+        # Get default agent config
+        default_agent_config = cfg.get_agent_config()
+
+        # Create default LLM summarizing condenser config
+        default_condenser = LLMSummarizingCondenserConfig(
+            llm_config=cfg.get_llm_config(),  # Use default LLM config
+        )
+
+        # Set as default condenser
+        default_agent_config.condenser = default_condenser
+        logger.openhands_logger.debug(
+            'Default LLM summarizing condenser assigned to default agent (no condenser in config)'
+        )
+
+    # Process extended section if present
+    if 'extended' in toml_config:
+        try:
+            cfg.extended = ExtendedConfig(toml_config['extended'])
+        except (TypeError, KeyError, ValidationError) as e:
+            logger.openhands_logger.warning(
+                f'Cannot parse [extended] config from toml, values have not been applied.\nError: {e}'
+            )
+
+    # Check for unknown sections
+    known_sections = {
+        'core',
+        'extended',
+        'agent',
+        'llm',
+        'security',
+        'sandbox',
+        'condenser',
+    }
+    for key in toml_config:
+        if key.lower() not in known_sections:
+            logger.openhands_logger.warning(f'Unknown section [{key}] in {toml_file}')
+
+
+def get_or_create_jwt_secret(file_store: FileStore) -> str:
+    try:
+        jwt_secret = file_store.read(JWT_SECRET)
+        return jwt_secret
+    except FileNotFoundError:
+        new_secret = uuid4().hex
+        file_store.write(JWT_SECRET, new_secret)
+        return new_secret
 
 
 def finalize_config(cfg: AppConfig):
@@ -210,8 +282,6 @@ def finalize_config(cfg: AppConfig):
     # make sure log_completions_folder is an absolute path
     for llm in cfg.llms.values():
         llm.log_completions_folder = os.path.abspath(llm.log_completions_folder)
-        if llm.embedding_base_url is None:
-            llm.embedding_base_url = llm.base_url
 
     if cfg.sandbox.use_host_network and platform.system() == 'Darwin':
         logger.openhands_logger.warning(
@@ -223,8 +293,67 @@ def finalize_config(cfg: AppConfig):
     if cfg.cache_dir:
         pathlib.Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
 
+    if not cfg.jwt_secret:
+        cfg.jwt_secret = SecretStr(
+            get_or_create_jwt_secret(
+                get_file_store(cfg.file_store, cfg.file_store_path)
+            )
+        )
 
-# Utility function for command line --group argument
+
+def get_agent_config_arg(
+    agent_config_arg: str, toml_file: str = 'config.toml'
+) -> AgentConfig | None:
+    """Get a group of agent settings from the config file.
+
+    A group in config.toml can look like this:
+
+    ```
+    [agent.default]
+    enable_prompt_extensions = false
+    ```
+
+    The user-defined group name, like "default", is the argument to this function. The function will load the AgentConfig object
+    with the settings of this group, from the config file, and set it as the AgentConfig object for the app.
+
+    Note that the group must be under "agent" group, or in other words, the group name must start with "agent.".
+
+    Args:
+        agent_config_arg: The group of agent settings to get from the config.toml file.
+        toml_file: Path to the configuration file to read from. Defaults to 'config.toml'.
+
+    Returns:
+        AgentConfig: The AgentConfig object with the settings from the config file.
+    """
+    # keep only the name, just in case
+    agent_config_arg = agent_config_arg.strip('[]')
+
+    # truncate the prefix, just in case
+    if agent_config_arg.startswith('agent.'):
+        agent_config_arg = agent_config_arg[6:]
+
+    logger.openhands_logger.debug(f'Loading agent config from {agent_config_arg}')
+
+    # load the toml file
+    try:
+        with open(toml_file, 'r', encoding='utf-8') as toml_contents:
+            toml_config = toml.load(toml_contents)
+    except FileNotFoundError as e:
+        logger.openhands_logger.error(f'Config file not found: {e}')
+        return None
+    except toml.TomlDecodeError as e:
+        logger.openhands_logger.error(
+            f'Cannot parse agent group from {agent_config_arg}. Exception: {e}'
+        )
+        return None
+
+    # update the agent config with the specified section
+    if 'agent' in toml_config and agent_config_arg in toml_config['agent']:
+        return AgentConfig(**toml_config['agent'][agent_config_arg])
+    logger.openhands_logger.debug(f'Loading from toml failed for {agent_config_arg}')
+    return None
+
+
 def get_llm_config_arg(
     llm_config_arg: str, toml_file: str = 'config.toml'
 ) -> LLMConfig | None:
@@ -277,15 +406,21 @@ def get_llm_config_arg(
 
     # update the llm config with the specified section
     if 'llm' in toml_config and llm_config_arg in toml_config['llm']:
-        return LLMConfig.from_dict(toml_config['llm'][llm_config_arg])
+        return LLMConfig(**toml_config['llm'][llm_config_arg])
     logger.openhands_logger.debug(f'Loading from toml failed for {llm_config_arg}')
     return None
 
 
 # Command line arguments
 def get_parser() -> argparse.ArgumentParser:
-    """Get the parser for the command line arguments."""
-    parser = argparse.ArgumentParser(description='Run an agent with a specific task')
+    """Get the argument parser."""
+    parser = argparse.ArgumentParser(description='Run the agent via CLI')
+
+    # Add version argument
+    parser.add_argument(
+        '-v', '--version', action='store_true', help='Show version information'
+    )
+
     parser.add_argument(
         '--config-file',
         type=str,
@@ -364,11 +499,17 @@ def get_parser() -> argparse.ArgumentParser:
         help='Replace default LLM ([llm] section in config.toml) config with the specified LLM config, e.g. "llama3" for [llm.llama3] section in config.toml',
     )
     parser.add_argument(
+        '--agent-config',
+        default=None,
+        type=str,
+        help='Replace default Agent ([agent] section in config.toml) config with the specified Agent config, e.g. "CodeAct" for [agent.CodeAct] section in config.toml',
+    )
+    parser.add_argument(
         '-n',
         '--name',
-        default='default',
+        help='Session name',
         type=str,
-        help='Name for the session',
+        default='',
     )
     parser.add_argument(
         '--eval-ids',
@@ -378,17 +519,29 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--no-auto-continue',
+        help='Disable auto-continue responses in headless mode (i.e. headless will read from stdin instead of auto-continuing)',
         action='store_true',
-        help='Disable automatic "continue" responses. Will read from stdin instead.',
+        default=False,
+    )
+    parser.add_argument(
+        '--selected-repo',
+        help='GitHub repository to clone (format: owner/repo)',
+        type=str,
+        default=None,
     )
     return parser
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Parse the command line arguments."""
+    """Parse command line arguments."""
     parser = get_parser()
-    parsed_args, _ = parser.parse_known_args()
-    return parsed_args
+    args = parser.parse_args()
+
+    if args.version:
+        print(f'OpenHands version: {__version__}')
+        sys.exit(0)
+
+    return args
 
 
 def load_app_config(
@@ -407,4 +560,40 @@ def load_app_config(
     if set_logging_levels:
         logger.DEBUG = config.debug
         logger.DISABLE_COLOR_PRINTING = config.disable_color
+    return config
+
+
+def setup_config_from_args(args: argparse.Namespace) -> AppConfig:
+    """Load config from toml and override with command line arguments.
+
+    Common setup used by both CLI and main.py entry points.
+    """
+    # Load base config from toml and env vars
+    config = load_app_config(config_file=args.config_file)
+
+    # Override with command line arguments if provided
+    if args.llm_config:
+        # if we didn't already load it, get it from the toml file
+        if args.llm_config not in config.llms:
+            llm_config = get_llm_config_arg(args.llm_config)
+        else:
+            llm_config = config.llms[args.llm_config]
+        if llm_config is None:
+            raise ValueError(f'Invalid toml file, cannot read {args.llm_config}')
+        config.set_llm_config(llm_config)
+
+    # Override default agent if provided
+    if args.agent_cls:
+        config.default_agent = args.agent_cls
+
+    # Set max iterations and max budget per task if provided, otherwise fall back to config values
+    if args.max_iterations is not None:
+        config.max_iterations = args.max_iterations
+    if args.max_budget_per_task is not None:
+        config.max_budget_per_task = args.max_budget_per_task
+
+    # Read selected repository in config for use by CLI and main.py
+    if args.selected_repo is not None:
+        config.sandbox.selected_repo = args.selected_repo
+
     return config

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 source ~/.bashrc
 SWEUTIL_DIR=/swe_util
@@ -33,7 +33,7 @@ if [ -d /workspace/$WORKSPACE_NAME ]; then
     rm -rf /workspace/$WORKSPACE_NAME
 fi
 mkdir -p /workspace
-ln -s /testbed /workspace/$WORKSPACE_NAME
+cp -r /testbed /workspace/$WORKSPACE_NAME
 
 # Activate instance-specific environment
 . /opt/miniconda3/etc/profile.d/conda.sh

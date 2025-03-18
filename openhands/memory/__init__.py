@@ -1,4 +1,3 @@
-from openhands.memory.condenser import MemoryCondenser
-from openhands.memory.memory import LongTermMemory
+from openhands.memory.condenser import Condenser
 
-__all__ = ['LongTermMemory', 'MemoryCondenser']
+__all__ = ['Condenser']

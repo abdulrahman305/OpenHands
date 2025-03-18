@@ -1,34 +1,38 @@
 import asyncio
-import hashlib
 import json
 import os
-import sys
-import uuid
-from typing import Callable, Protocol, Type
+from pathlib import Path
+from typing import Callable, Protocol
 
 import openhands.agenthub  # noqa F401 (we import this to get the agents registered)
-from openhands.controller import AgentController
 from openhands.controller.agent import Agent
 from openhands.controller.state.state import State
 from openhands.core.config import (
     AppConfig,
-    get_llm_config_arg,
-    load_app_config,
     parse_arguments,
+    setup_config_from_args,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.loop import run_agent_until_done
 from openhands.core.schema import AgentState
-from openhands.events import EventSource, EventStream, EventStreamSubscriber
-from openhands.events.action import MessageAction
+from openhands.core.setup import (
+    create_agent,
+    create_controller,
+    create_memory,
+    create_runtime,
+    generate_sid,
+    initialize_repository_for_runtime,
+)
+from openhands.events import EventSource, EventStreamSubscriber
+from openhands.events.action import MessageAction, NullAction
 from openhands.events.action.action import Action
 from openhands.events.event import Event
 from openhands.events.observation import AgentStateChangedObservation
-from openhands.events.serialization.event import event_to_trajectory
-from openhands.llm.llm import LLM
-from openhands.runtime import get_runtime_cls
+from openhands.events.serialization import event_from_dict
+from openhands.io import read_input, read_task
+from openhands.memory.memory import Memory
 from openhands.runtime.base import Runtime
-from openhands.storage import get_file_store
+from openhands.utils.async_utils import call_async_from_sync
 
 
 class FakeUserResponseFunc(Protocol):
@@ -40,56 +44,6 @@ class FakeUserResponseFunc(Protocol):
     ) -> str: ...
 
 
-def read_task_from_file(file_path: str) -> str:
-    """Read task from the specified file."""
-    with open(file_path, 'r', encoding='utf-8') as file:
-        return file.read()
-
-
-def read_task_from_stdin() -> str:
-    """Read task from stdin."""
-    return sys.stdin.read()
-
-
-def create_runtime(
-    config: AppConfig,
-    sid: str | None = None,
-    headless_mode: bool = True,
-) -> Runtime:
-    """Create a runtime for the agent to run on.
-
-    config: The app config.
-    sid: (optional) The session id. IMPORTANT: please don't set this unless you know what you're doing.
-        Set it to incompatible value will cause unexpected behavior on RemoteRuntime.
-    headless_mode: Whether the agent is run in headless mode. `create_runtime` is typically called within evaluation scripts,
-        where we don't want to have the VSCode UI open, so it defaults to True.
-    """
-    # if sid is provided on the command line, use it as the name of the event stream
-    # otherwise generate it on the basis of the configured jwt_secret
-    # we can do this better, this is just so that the sid is retrieved when we want to restore the session
-    session_id = sid or generate_sid(config)
-
-    # set up the event stream
-    file_store = get_file_store(config.file_store, config.file_store_path)
-    event_stream = EventStream(session_id, file_store)
-
-    # agent class
-    agent_cls = openhands.agenthub.Agent.get_cls(config.default_agent)
-
-    # runtime and tools
-    runtime_cls = get_runtime_cls(config.runtime)
-    logger.debug(f'Initializing runtime: {runtime_cls.__name__}')
-    runtime: Runtime = runtime_cls(
-        config=config,
-        event_stream=event_stream,
-        sid=session_id,
-        plugins=agent_cls.sandbox_plugins,
-        headless_mode=headless_mode,
-    )
-
-    return runtime
-
-
 async def run_controller(
     config: AppConfig,
     initial_user_action: Action,
@@ -99,8 +53,10 @@ async def run_controller(
     exit_on_message: bool = False,
     fake_user_response_fn: FakeUserResponseFunc | None = None,
     headless_mode: bool = True,
+    memory: Memory | None = None,
 ) -> State | None:
     """Main coroutine to run the agent controller with task input flexibility.
+
     It's only used when you launch openhands backend directly via cmdline.
 
     Args:
@@ -114,53 +70,78 @@ async def run_controller(
         fake_user_response_fn: An optional function that receives the current state
             (could be None) and returns a fake user response.
         headless_mode: Whether the agent is run in headless mode.
-    """
-    # Create the agent
-    if agent is None:
-        agent_cls: Type[Agent] = Agent.get_cls(config.default_agent)
-        agent_config = config.get_agent_config(config.default_agent)
-        llm_config = config.get_llm_config_from_agent(config.default_agent)
-        agent = agent_cls(
-            llm=LLM(config=llm_config),
-            config=agent_config,
-        )
 
-    # make sure the session id is set
+    Returns:
+        The final state of the agent, or None if an error occurred.
+
+    Raises:
+        AssertionError: If initial_user_action is not an Action instance.
+        Exception: Various exceptions may be raised during execution and will be logged.
+
+    Notes:
+        - State persistence: If config.file_store is set, the agent's state will be
+          saved between sessions.
+        - Trajectories: If config.trajectories_path is set, execution history will be
+          saved as JSON for analysis.
+        - Budget control: Execution is limited by config.max_iterations and
+          config.max_budget_per_task.
+
+    Example:
+        >>> config = load_app_config()
+        >>> action = MessageAction(content="Write a hello world program")
+        >>> state = await run_controller(config=config, initial_user_action=action)
+    """
     sid = sid or generate_sid(config)
 
+    if agent is None:
+        agent = create_agent(config)
+
+    # when the runtime is created, it will be connected and clone the selected repository
+    repo_directory = None
     if runtime is None:
-        runtime = create_runtime(config, sid=sid, headless_mode=headless_mode)
-        await runtime.connect()
+        runtime = create_runtime(
+            config,
+            sid=sid,
+            headless_mode=headless_mode,
+            agent=agent,
+        )
+        # Connect to the runtime
+        call_async_from_sync(runtime.connect)
+
+        # Initialize repository if needed
+        if config.sandbox.selected_repo:
+            repo_directory = initialize_repository_for_runtime(
+                runtime,
+                selected_repository=config.sandbox.selected_repo,
+            )
 
     event_stream = runtime.event_stream
 
-    # restore cli session if available
-    initial_state = None
-    try:
-        logger.debug(
-            f'Trying to restore agent state from cli session {event_stream.sid} if available'
+    # when memory is created, it will load the microagents from the selected repository
+    if memory is None:
+        memory = create_memory(
+            runtime=runtime,
+            event_stream=event_stream,
+            sid=sid,
+            selected_repository=config.sandbox.selected_repo,
+            repo_directory=repo_directory,
         )
-        initial_state = State.restore_from_session(
-            event_stream.sid, event_stream.file_store
-        )
-    except Exception as e:
-        logger.debug(f'Cannot restore agent state: {e}')
 
-    # init controller with this initial state
-    controller = AgentController(
-        agent=agent,
-        max_iterations=config.max_iterations,
-        max_budget_per_task=config.max_budget_per_task,
-        agent_to_llm_config=config.get_agent_to_llm_config_map(),
-        event_stream=event_stream,
-        initial_state=initial_state,
-        headless_mode=headless_mode,
+    replay_events: list[Event] | None = None
+    if config.replay_trajectory_path:
+        logger.info('Trajectory replay is enabled')
+        assert isinstance(initial_user_action, NullAction)
+        replay_events, initial_user_action = load_replay_log(
+            config.replay_trajectory_path
+        )
+
+    controller, initial_state = create_controller(
+        agent, runtime, config, replay_events=replay_events
     )
 
     assert isinstance(
         initial_user_action, Action
     ), f'initial user actions must be an Action, got {type(initial_user_action)}'
-    # Logging
     logger.debug(
         f'Agent Controller Initialized: Running agent {agent.name}, model '
         f'{agent.llm.config.model}, with actions: {initial_user_action}'
@@ -182,15 +163,13 @@ async def run_controller(
         # init with the provided actions
         event_stream.add_event(initial_user_action, EventSource.USER)
 
-    async def on_event(event: Event):
+    def on_event(event: Event):
         if isinstance(event, AgentStateChangedObservation):
             if event.agent_state == AgentState.AWAITING_USER_INPUT:
                 if exit_on_message:
                     message = '/exit'
                 elif fake_user_response_fn is None:
-                    # read until EOF (Ctrl+D on Unix, Ctrl+Z on Windows)
-                    print('Request user input (press Ctrl+D/Z when done) >> ')
-                    message = sys.stdin.read().rstrip()
+                    message = read_input(config.cli_multiline_input)
                 else:
                     message = fake_user_response_fn(controller.get_state())
                 action = MessageAction(content=message)
@@ -207,7 +186,7 @@ async def run_controller(
     ]
 
     try:
-        await run_agent_until_done(controller, runtime, end_states)
+        await run_agent_until_done(controller, runtime, memory, end_states)
     except Exception as e:
         logger.error(f'Exception in main loop: {e}')
 
@@ -217,30 +196,23 @@ async def run_controller(
         # NOTE: the saved state does not include delegates events
         end_state.save_to_session(event_stream.sid, event_stream.file_store)
 
+    await controller.close(set_stop_state=False)
+
     state = controller.get_state()
 
     # save trajectories if applicable
-    if config.trajectories_path is not None:
-        # if trajectories_path is a folder, use session id as file name
-        if os.path.isdir(config.trajectories_path):
-            file_path = os.path.join(config.trajectories_path, sid + '.json')
+    if config.save_trajectory_path is not None:
+        # if save_trajectory_path is a folder, use session id as file name
+        if os.path.isdir(config.save_trajectory_path):
+            file_path = os.path.join(config.save_trajectory_path, sid + '.json')
         else:
-            file_path = config.trajectories_path
+            file_path = config.save_trajectory_path
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        histories = [event_to_trajectory(event) for event in state.history]
+        histories = controller.get_trajectory()
         with open(file_path, 'w') as f:
             json.dump(histories, f)
 
     return state
-
-
-def generate_sid(config: AppConfig, session_name: str | None = None) -> str:
-    """Generate a session id based on the session name and the jwt secret."""
-    session_name = session_name or str(uuid.uuid4())
-    jwt_secret = config.jwt_secret
-
-    hash_str = hashlib.sha256(f'{session_name}{jwt_secret}'.encode('utf-8')).hexdigest()
-    return f'{session_name}-{hash_str[:16]}'
 
 
 def auto_continue_response(
@@ -249,48 +221,78 @@ def auto_continue_response(
     try_parse: Callable[[Action | None], str] | None = None,
 ) -> str:
     """Default function to generate user responses.
-    Returns 'continue' to tell the agent to proceed without asking for more input.
+    Tell the agent to proceed without asking for more input, or finish the interaction.
     """
-    return 'continue'
+    message = (
+        'Please continue on whatever approach you think is suitable.\n'
+        'If you think you have solved the task, please finish the interaction.\n'
+        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN RESPONSE.\n'
+    )
+    return message
+
+
+def load_replay_log(trajectory_path: str) -> tuple[list[Event] | None, Action]:
+    """
+    Load trajectory from given path, serialize it to a list of events, and return
+    two things:
+    1) A list of events except the first action
+    2) First action (user message, a.k.a. initial task)
+    """
+    try:
+        path = Path(trajectory_path).resolve()
+
+        if not path.exists():
+            raise ValueError(f'Trajectory file not found: {path}')
+
+        if not path.is_file():
+            raise ValueError(f'Trajectory path is a directory, not a file: {path}')
+
+        with open(path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+            if not isinstance(data, list):
+                raise ValueError(
+                    f'Expected a list in {path}, got {type(data).__name__}'
+                )
+            events = []
+            for item in data:
+                event = event_from_dict(item)
+                if event.source == EventSource.ENVIRONMENT:
+                    # ignore ENVIRONMENT events as they are not issued by
+                    # the user or agent, and should not be replayed
+                    continue
+                # cannot add an event with _id to event stream
+                event._id = None  # type: ignore[attr-defined]
+                events.append(event)
+            assert isinstance(events[0], MessageAction)
+            return events[1:], events[0]
+    except json.JSONDecodeError as e:
+        raise ValueError(f'Invalid JSON format in {trajectory_path}: {e}')
 
 
 if __name__ == '__main__':
     args = parse_arguments()
 
-    # Determine the task
-    if args.file:
-        task_str = read_task_from_file(args.file)
-    elif args.task:
-        task_str = args.task
-    elif not sys.stdin.isatty():
-        task_str = read_task_from_stdin()
+    config: AppConfig = setup_config_from_args(args)
+
+    # Read task from file, CLI args, or stdin
+    task_str = read_task(args, config.cli_multiline_input)
+
+    initial_user_action: Action = NullAction()
+    if config.replay_trajectory_path:
+        if task_str:
+            raise ValueError(
+                'User-specified task is not supported under trajectory replay mode'
+            )
     else:
-        raise ValueError('No task provided. Please specify a task through -t, -f.')
-    initial_user_action: MessageAction = MessageAction(content=task_str)
-    # Load the app config
-    # this will load config from config.toml in the current directory
-    # as well as from the environment variables
-    config = load_app_config(config_file=args.config_file)
+        if not task_str:
+            raise ValueError('No task provided. Please specify a task through -t, -f.')
 
-    # Override default LLM configs ([llm] section in config.toml)
-    if args.llm_config:
-        llm_config = get_llm_config_arg(args.llm_config)
-        if llm_config is None:
-            raise ValueError(f'Invalid toml file, cannot read {args.llm_config}')
-        config.set_llm_config(llm_config)
-
-    # Set default agent
-    config.default_agent = args.agent_cls
+        # Create actual initial user action
+        initial_user_action = MessageAction(content=task_str)
 
     # Set session name
     session_name = args.name
     sid = generate_sid(config, session_name)
-
-    # if max budget per task is not sent on the command line, use the config value
-    if args.max_budget_per_task is not None:
-        config.max_budget_per_task = args.max_budget_per_task
-    if args.max_iterations is not None:
-        config.max_iterations = args.max_iterations
 
     asyncio.run(
         run_controller(

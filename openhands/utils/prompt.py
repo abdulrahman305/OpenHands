@@ -1,58 +1,47 @@
 import os
+from dataclasses import dataclass, field
 from itertools import islice
 
 from jinja2 import Template
 
 from openhands.controller.state.state import State
 from openhands.core.message import Message, TextContent
-from openhands.utils.microagent import MicroAgent
+from openhands.events.observation.agent import MicroagentKnowledge
+
+
+@dataclass
+class RuntimeInfo:
+    available_hosts: dict[str, int] = field(default_factory=dict)
+    additional_agent_instructions: str = ''
+
+
+@dataclass
+class RepositoryInfo:
+    """Information about a GitHub repository that has been cloned."""
+
+    repo_name: str | None = None
+    repo_directory: str | None = None
 
 
 class PromptManager:
     """
-    Manages prompt templates and micro-agents for AI interactions.
+    Manages prompt templates and includes information from the user's workspace micro-agents and global micro-agents.
 
-    This class handles loading and rendering of system and user prompt templates,
-    as well as loading micro-agent specifications. It provides methods to access
-    rendered system and initial user messages for AI interactions.
+    This class is dedicated to loading and rendering prompts (system prompt, user prompt).
 
     Attributes:
-        prompt_dir (str): Directory containing prompt templates.
-        microagent_dir (str): Directory containing microagent specifications.
-        disabled_microagents (list[str] | None): List of microagents to disable. If None, all microagents are enabled.
+        prompt_dir: Directory containing prompt templates.
     """
 
     def __init__(
         self,
         prompt_dir: str,
-        microagent_dir: str | None = None,
-        disabled_microagents: list[str] | None = None,
     ):
         self.prompt_dir: str = prompt_dir
-
         self.system_template: Template = self._load_template('system_prompt')
         self.user_template: Template = self._load_template('user_prompt')
-        self.microagents: dict = {}
-
-        microagent_files = []
-        if microagent_dir:
-            microagent_files = [
-                os.path.join(microagent_dir, f)
-                for f in os.listdir(microagent_dir)
-                if f.endswith('.md')
-            ]
-        for microagent_file in microagent_files:
-            microagent = MicroAgent(path=microagent_file)
-            if (
-                disabled_microagents is None
-                or microagent.name not in disabled_microagents
-            ):
-                self.microagents[microagent.name] = microagent
-
-    def load_microagent_files(self, microagent_files: list[str]):
-        for microagent_file in microagent_files:
-            microagent = MicroAgent(content=microagent_file)
-            self.microagents[microagent.name] = microagent
+        self.additional_info_template: Template = self._load_template('additional_info')
+        self.microagent_info_template: Template = self._load_template('microagent_info')
 
     def _load_template(self, template_name: str) -> Template:
         if self.prompt_dir is None:
@@ -76,25 +65,43 @@ class PromptManager:
         These additional context will convert the current generic agent
         into a more specialized agent that is tailored to the user's task.
         """
+
         return self.user_template.render().strip()
 
-    def enhance_message(self, message: Message) -> None:
-        """Enhance the user message with additional context.
+    def add_examples_to_initial_message(self, message: Message) -> None:
+        """Add example_message to the first user message."""
+        example_message = self.get_example_user_message() or None
 
-        This method is used to enhance the user message with additional context
-        about the user's task. The additional context will convert the current
-        generic agent into a more specialized agent that is tailored to the user's task.
+        # Insert it at the start of the TextContent list
+        if example_message:
+            message.content.insert(0, TextContent(text=example_message))
+
+    def build_workspace_context(
+        self,
+        repository_info: RepositoryInfo | None,
+        runtime_info: RuntimeInfo | None,
+        repo_instructions: str = '',
+    ) -> str:
+        """Renders the additional info template with the stored repository/runtime info."""
+        return self.additional_info_template.render(
+            repository_info=repository_info,
+            repository_instructions=repo_instructions,
+            runtime_info=runtime_info,
+        ).strip()
+
+    def build_microagent_info(
+        self,
+        triggered_agents: list[MicroagentKnowledge],
+    ) -> str:
+        """Renders the microagent info template with the triggered agents.
+
+        Args:
+            triggered_agents: A list of MicroagentKnowledge objects containing information
+                              about triggered microagents.
         """
-        if not message.content:
-            return
-        message_content = message.content[0].text
-        for microagent in self.microagents.values():
-            trigger = microagent.get_trigger(message_content)
-            if trigger:
-                micro_text = f'<extra_info>\nThe following information has been included based on a keyword match for "{trigger}". It may or may not be relevant to the user\'s request.'
-                micro_text += '\n\n' + microagent.content
-                micro_text += '\n</extra_info>'
-                message.content.append(TextContent(text=micro_text))
+        return self.microagent_info_template.render(
+            triggered_agents=triggered_agents
+        ).strip()
 
     def add_turns_left_reminder(self, messages: list[Message], state: State) -> None:
         latest_user_message = next(

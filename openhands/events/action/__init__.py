@@ -4,7 +4,9 @@ from openhands.events.action.agent import (
     AgentFinishAction,
     AgentRejectAction,
     AgentSummarizeAction,
+    AgentThinkAction,
     ChangeAgentStateAction,
+    RecallAction,
 )
 from openhands.events.action.browse import BrowseInteractiveAction, BrowseURLAction
 from openhands.events.action.commands import CmdRunAction, IPythonRunCellAction
@@ -15,7 +17,6 @@ from openhands.events.action.files import (
     FileWriteAction,
 )
 from openhands.events.action.message import MessageAction
-from openhands.events.action.tasks import AddTaskAction, ModifyTaskAction
 
 __all__ = [
     'Action',
@@ -30,10 +31,10 @@ __all__ = [
     'AgentRejectAction',
     'AgentDelegateAction',
     'AgentSummarizeAction',
-    'AddTaskAction',
-    'ModifyTaskAction',
     'ChangeAgentStateAction',
     'IPythonRunCellAction',
     'MessageAction',
     'ActionConfirmationStatus',
+    'AgentThinkAction',
+    'RecallAction',
 ]

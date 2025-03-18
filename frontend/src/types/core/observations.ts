@@ -1,4 +1,4 @@
-import AgentState from "../agent-state";
+import { AgentState } from "../agent-state";
 import { OpenHandsObservationEvent } from "./base";
 
 export interface AgentStateChangeObservation
@@ -13,9 +13,8 @@ export interface CommandObservation extends OpenHandsObservationEvent<"run"> {
   source: "agent";
   extras: {
     command: string;
-    command_id: number;
-    exit_code: number;
     hidden?: boolean;
+    metadata: Record<string, unknown>;
   };
 }
 
@@ -64,6 +63,16 @@ export interface ReadObservation extends OpenHandsObservationEvent<"read"> {
   source: "agent";
   extras: {
     path: string;
+    impl_source: string;
+  };
+}
+
+export interface EditObservation extends OpenHandsObservationEvent<"edit"> {
+  source: "agent";
+  extras: {
+    path: string;
+    diff: string;
+    impl_source: string;
   };
 }
 
@@ -74,12 +83,22 @@ export interface ErrorObservation extends OpenHandsObservationEvent<"error"> {
   };
 }
 
+export interface AgentThinkObservation
+  extends OpenHandsObservationEvent<"think"> {
+  source: "agent";
+  extras: {
+    thought: string;
+  };
+}
+
 export type OpenHandsObservation =
   | AgentStateChangeObservation
+  | AgentThinkObservation
   | CommandObservation
   | IPythonObservation
   | DelegateObservation
   | BrowseObservation
   | WriteObservation
   | ReadObservation
+  | EditObservation
   | ErrorObservation;

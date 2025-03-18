@@ -8,11 +8,8 @@ NOTE: this will be executed inside the docker sandbox.
 import argparse
 import asyncio
 import base64
-import io
-import json
 import mimetypes
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -23,25 +20,34 @@ from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
+from openhands_aci.editor.editor import OHEditor
+from openhands_aci.editor.exceptions import ToolError
+from openhands_aci.editor.results import ToolResult
+from openhands_aci.utils.diff import get_diff
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import run
 
+from openhands.core.exceptions import BrowserUnavailableException
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
     Action,
     BrowseInteractiveAction,
     BrowseURLAction,
     CmdRunAction,
+    FileEditAction,
     FileReadAction,
     FileWriteAction,
     IPythonRunCellAction,
 )
+from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
+    FileEditObservation,
     FileReadObservation,
     FileWriteObservation,
     IPythonRunCellObservation,
@@ -53,8 +59,8 @@ from openhands.runtime.browser.browser_env import BrowserEnv
 from openhands.runtime.plugins import ALL_PLUGINS, JupyterPlugin, Plugin, VSCodePlugin
 from openhands.runtime.utils.bash import BashSession
 from openhands.runtime.utils.files import insert_lines, read_lines
+from openhands.runtime.utils.memory_monitor import MemoryMonitor
 from openhands.runtime.utils.runtime_init import init_user_and_working_directory
-from openhands.runtime.utils.system import check_port_available
 from openhands.runtime.utils.system_stats import get_system_stats
 from openhands.utils.async_utils import call_sync_from_async, wait_all
 
@@ -64,9 +70,6 @@ class ActionRequest(BaseModel):
 
 
 ROOT_GID = 0
-INIT_COMMANDS = [
-    'git config --global user.name "openhands" && git config --global user.email "openhands@all-hands.dev" && alias git="git --no-pager"',
-]
 
 SESSION_API_KEY = os.environ.get('SESSION_API_KEY')
 api_key_header = APIKeyHeader(name='X-Session-API-Key', auto_error=False)
@@ -76,6 +79,58 @@ def verify_api_key(api_key: str = Depends(api_key_header)):
     if SESSION_API_KEY and api_key != SESSION_API_KEY:
         raise HTTPException(status_code=403, detail='Invalid API Key')
     return api_key
+
+
+def _execute_file_editor(
+    editor: OHEditor,
+    command: str,
+    path: str,
+    file_text: str | None = None,
+    view_range: list[int] | None = None,
+    old_str: str | None = None,
+    new_str: str | None = None,
+    insert_line: int | None = None,
+    enable_linting: bool = False,
+) -> tuple[str, tuple[str | None, str | None]]:
+    """Execute file editor command and handle exceptions.
+
+    Args:
+        editor: The OHEditor instance
+        command: Editor command to execute
+        path: File path
+        file_text: Optional file text content
+        view_range: Optional view range tuple (start, end)
+        old_str: Optional string to replace
+        new_str: Optional replacement string
+        insert_line: Optional line number for insertion
+        enable_linting: Whether to enable linting
+
+    Returns:
+        tuple: A tuple containing the output string and a tuple of old and new file content
+    """
+    result: ToolResult | None = None
+    try:
+        result = editor(
+            command=command,
+            path=path,
+            file_text=file_text,
+            view_range=view_range,
+            old_str=old_str,
+            new_str=new_str,
+            insert_line=insert_line,
+            enable_linting=enable_linting,
+        )
+    except ToolError as e:
+        result = ToolResult(error=e.message)
+
+    if result.error:
+        return f'ERROR:\n{result.error}', (None, None)
+
+    if not result.output:
+        logger.warning(f'No output from file_editor for {path}')
+        return '', (None, None)
+
+    return result.output, (result.old_content, result.new_content)
 
 
 class ActionExecutor:
@@ -92,39 +147,105 @@ class ActionExecutor:
         browsergym_eval_env: str | None,
     ) -> None:
         self.plugins_to_load = plugins_to_load
-        self._initial_pwd = work_dir
+        self._initial_cwd = work_dir
         self.username = username
         self.user_id = user_id
         _updated_user_id = init_user_and_working_directory(
-            username=username, user_id=self.user_id, initial_pwd=work_dir
+            username=username, user_id=self.user_id, initial_cwd=work_dir
         )
         if _updated_user_id is not None:
             self.user_id = _updated_user_id
 
-        self.bash_session = BashSession(
-            work_dir=work_dir,
-            username=username,
-        )
-
+        self.bash_session: BashSession | None = None
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
-        self.browser = BrowserEnv(browsergym_eval_env)
+        self.file_editor = OHEditor(workspace_root=self._initial_cwd)
+        self.browser: BrowserEnv | None = None
+        self.browser_init_task: asyncio.Task | None = None
+        self.browsergym_eval_env = browsergym_eval_env
         self.start_time = time.time()
         self.last_execution_time = self.start_time
+        self._initialized = False
+
+        self.max_memory_gb: int | None = None
+        if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
+            self.max_memory_gb = int(_override_max_memory_gb)
+            logger.info(
+                f'Setting max memory to {self.max_memory_gb}GB (according to the RUNTIME_MAX_MEMORY_GB environment variable)'
+            )
+        else:
+            logger.info('No max memory limit set, using all available system memory')
+
+        self.memory_monitor = MemoryMonitor(
+            enable=os.environ.get('RUNTIME_MEMORY_MONITOR', 'False').lower()
+            in ['true', '1', 'yes']
+        )
+        self.memory_monitor.start_monitoring()
 
     @property
-    def initial_pwd(self):
-        return self._initial_pwd
+    def initial_cwd(self):
+        return self._initial_cwd
+
+    async def _init_browser_async(self):
+        """Initialize the browser asynchronously."""
+        logger.debug('Initializing browser asynchronously')
+        try:
+            self.browser = BrowserEnv(self.browsergym_eval_env)
+            logger.debug('Browser initialized asynchronously')
+        except Exception as e:
+            logger.error(f'Failed to initialize browser: {e}')
+            self.browser = None
+
+    async def _ensure_browser_ready(self):
+        """Ensure the browser is ready for use."""
+        if self.browser is None:
+            if self.browser_init_task is None:
+                # Start browser initialization if it hasn't been started
+                self.browser_init_task = asyncio.create_task(self._init_browser_async())
+            elif self.browser_init_task.done():
+                # If the task is done but browser is still None, restart initialization
+                self.browser_init_task = asyncio.create_task(self._init_browser_async())
+
+            # Wait for browser to be initialized
+            if self.browser_init_task:
+                logger.debug('Waiting for browser to be ready...')
+                await self.browser_init_task
+
+            # Check if browser was successfully initialized
+            if self.browser is None:
+                raise BrowserUnavailableException('Browser initialization failed')
+
+        # If we get here, the browser is ready
+        logger.debug('Browser is ready')
 
     async def ainit(self):
+        # bash needs to be initialized first
+        logger.debug('Initializing bash session')
+        self.bash_session = BashSession(
+            work_dir=self._initial_cwd,
+            username=self.username,
+            no_change_timeout_seconds=int(
+                os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 30)
+            ),
+            max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
+        )
+        self.bash_session.initialize()
+        logger.debug('Bash session initialized')
+
+        # Start browser initialization in the background
+        self.browser_init_task = asyncio.create_task(self._init_browser_async())
+        logger.debug('Browser initialization started in background')
+
         await wait_all(
             (self._init_plugin(plugin) for plugin in self.plugins_to_load),
             timeout=30,
         )
+        logger.debug('All plugins initialized')
 
         # This is a temporary workaround
         # TODO: refactor AgentSkills to be part of JupyterPlugin
         # AFTER ServerRuntime is deprecated
+        logger.debug('Initializing AgentSkills')
         if 'agent_skills' in self.plugins and 'jupyter' in self.plugins:
             obs = await self.run_ipython(
                 IPythonRunCellAction(
@@ -133,10 +254,17 @@ class ActionExecutor:
             )
             logger.debug(f'AgentSkills initialized: {obs}')
 
+        logger.debug('Initializing bash commands')
         await self._init_bash_commands()
         logger.debug('Runtime client initialized.')
+        self._initialized = True
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
 
     async def _init_plugin(self, plugin: Plugin):
+        assert self.bash_session is not None
         await plugin.initialize(self.username)
         self.plugins[plugin.name] = plugin
         logger.debug(f'Initializing plugin: {plugin.name}')
@@ -144,15 +272,20 @@ class ActionExecutor:
         if isinstance(plugin, JupyterPlugin):
             await self.run_ipython(
                 IPythonRunCellAction(
-                    code=f'import os; os.chdir("{self.bash_session.pwd}")'
+                    code=f'import os; os.chdir("{self.bash_session.cwd}")'
                 )
             )
 
     async def _init_bash_commands(self):
+        INIT_COMMANDS = [
+            'git config --file ./.git_config user.name "openhands" && git config --file ./.git_config user.email "openhands@all-hands.dev" && alias git="git --no-pager" && export GIT_CONFIG=$(pwd)/.git_config'
+            if os.environ.get('LOCAL_RUNTIME_MODE') == '1'
+            else 'git config --global user.name "openhands" && git config --global user.email "openhands@all-hands.dev" && alias git="git --no-pager"'
+        ]
         logger.debug(f'Initializing by running {len(INIT_COMMANDS)} bash commands...')
         for command in INIT_COMMANDS:
             action = CmdRunAction(command=command)
-            action.timeout = 300
+            action.set_hard_timeout(300)
             logger.debug(f'Executing init command: {command}')
             obs = await self.run(action)
             assert isinstance(obs, CmdOutputObservation)
@@ -160,7 +293,6 @@ class ActionExecutor:
                 f'Init command outputs (exit code: {obs.exit_code}): {obs.content}'
             )
             assert obs.exit_code == 0
-
         logger.debug('Bash init commands completed')
 
     async def run_action(self, action) -> Observation:
@@ -174,56 +306,39 @@ class ActionExecutor:
     async def run(
         self, action: CmdRunAction
     ) -> CmdOutputObservation | ErrorObservation:
-        obs = await call_sync_from_async(self.bash_session.run, action)
+        assert self.bash_session is not None
+        obs = await call_sync_from_async(self.bash_session.execute, action)
         return obs
 
     async def run_ipython(self, action: IPythonRunCellAction) -> Observation:
+        assert self.bash_session is not None
         if 'jupyter' in self.plugins:
             _jupyter_plugin: JupyterPlugin = self.plugins['jupyter']  # type: ignore
             # This is used to make AgentSkills in Jupyter aware of the
             # current working directory in Bash
-            jupyter_pwd = getattr(self, '_jupyter_pwd', None)
-            if self.bash_session.pwd != jupyter_pwd:
+            jupyter_cwd = getattr(self, '_jupyter_cwd', None)
+            if self.bash_session.cwd != jupyter_cwd:
                 logger.debug(
-                    f'{self.bash_session.pwd} != {jupyter_pwd} -> reset Jupyter PWD'
+                    f'{self.bash_session.cwd} != {jupyter_cwd} -> reset Jupyter PWD'
                 )
-                reset_jupyter_pwd_code = (
-                    f'import os; os.chdir("{self.bash_session.pwd}")'
+                reset_jupyter_cwd_code = (
+                    f'import os; os.chdir("{self.bash_session.cwd}")'
                 )
-                _aux_action = IPythonRunCellAction(code=reset_jupyter_pwd_code)
+                _aux_action = IPythonRunCellAction(code=reset_jupyter_cwd_code)
                 _reset_obs: IPythonRunCellObservation = await _jupyter_plugin.run(
                     _aux_action
                 )
                 logger.debug(
-                    f'Changed working directory in IPython to: {self.bash_session.pwd}. Output: {_reset_obs}'
+                    f'Changed working directory in IPython to: {self.bash_session.cwd}. Output: {_reset_obs}'
                 )
-                self._jupyter_pwd = self.bash_session.pwd
+                self._jupyter_cwd = self.bash_session.cwd
 
             obs: IPythonRunCellObservation = await _jupyter_plugin.run(action)
             obs.content = obs.content.rstrip()
-            matches = re.findall(
-                r'<oh_aci_output>(.*?)</oh_aci_output>', obs.content, re.DOTALL
-            )
-            if matches:
-                results = []
-                for match in matches:
-                    try:
-                        result_dict = json.loads(match)
-                        results.append(
-                            result_dict.get('formatted_output_and_error', '')
-                        )
-                    except json.JSONDecodeError:
-                        # Handle JSON decoding errors if necessary
-                        results.append(
-                            f"Invalid JSON in 'openhands-aci' output: {match}"
-                        )
-
-                # Combine the results (e.g., join them) or handle them as required
-                obs.content = '\n'.join(results)
 
             if action.include_extra:
                 obs.content += (
-                    f'\n[Jupyter current working directory: {self.bash_session.pwd}]'
+                    f'\n[Jupyter current working directory: {self.bash_session.cwd}]'
                 )
                 obs.content += f'\n[Jupyter Python interpreter: {_jupyter_plugin.python_interpreter_path}]'
             return obs
@@ -239,9 +354,24 @@ class ActionExecutor:
         return str(filepath)
 
     async def read(self, action: FileReadAction) -> Observation:
+        assert self.bash_session is not None
+        if action.impl_source == FileReadSource.OH_ACI:
+            result_str, _ = _execute_file_editor(
+                self.file_editor,
+                command='view',
+                path=action.path,
+                view_range=action.view_range,
+            )
+
+            return FileReadObservation(
+                content=result_str,
+                path=action.path,
+                impl_source=FileReadSource.OH_ACI,
+            )
+
         # NOTE: the client code is running inside the sandbox,
         # so there's no need to check permission
-        working_dir = self.bash_session.workdir
+        working_dir = self.bash_session.cwd
         filepath = self._resolve_path(action.path, working_dir)
         try:
             if filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
@@ -288,69 +418,99 @@ class ActionExecutor:
         return FileReadObservation(path=filepath, content=code_view)
 
     async def write(self, action: FileWriteAction) -> Observation:
-        working_dir = self.bash_session.workdir
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
         filepath = self._resolve_path(action.path, working_dir)
 
         insert = action.content.split('\n')
+        if not os.path.exists(os.path.dirname(filepath)):
+            os.makedirs(os.path.dirname(filepath))
+
+        file_exists = os.path.exists(filepath)
+        if file_exists:
+            file_stat = os.stat(filepath)
+        else:
+            file_stat = None
+
+        mode = 'w' if not file_exists else 'r+'
         try:
-            if not os.path.exists(os.path.dirname(filepath)):
-                os.makedirs(os.path.dirname(filepath))
-
-            file_exists = os.path.exists(filepath)
-            if file_exists:
-                file_stat = os.stat(filepath)
-            else:
-                file_stat = None
-
-            mode = 'w' if not file_exists else 'r+'
-            try:
-                with open(filepath, mode, encoding='utf-8') as file:
-                    if mode != 'w':
-                        all_lines = file.readlines()
-                        new_file = insert_lines(
-                            insert, all_lines, action.start, action.end
-                        )
-                    else:
-                        new_file = [i + '\n' for i in insert]
-
-                    file.seek(0)
-                    file.writelines(new_file)
-                    file.truncate()
-
-                # Handle file permissions
-                if file_exists:
-                    assert file_stat is not None
-                    # restore the original file permissions if the file already exists
-                    os.chmod(filepath, file_stat.st_mode)
-                    os.chown(filepath, file_stat.st_uid, file_stat.st_gid)
+            with open(filepath, mode, encoding='utf-8') as file:
+                if mode != 'w':
+                    all_lines = file.readlines()
+                    new_file = insert_lines(insert, all_lines, action.start, action.end)
                 else:
-                    # set the new file permissions if the file is new
-                    os.chmod(filepath, 0o664)
-                    os.chown(filepath, self.user_id, self.user_id)
+                    new_file = [i + '\n' for i in insert]
 
-            except FileNotFoundError:
-                return ErrorObservation(f'File not found: {filepath}')
-            except IsADirectoryError:
-                return ErrorObservation(
-                    f'Path is a directory: {filepath}. You can only write to files'
-                )
-            except UnicodeDecodeError:
-                return ErrorObservation(
-                    f'File could not be decoded as utf-8: {filepath}'
-                )
-        except PermissionError:
-            return ErrorObservation(f'Malformed paths not permitted: {filepath}')
+                file.seek(0)
+                file.writelines(new_file)
+                file.truncate()
+
+        except FileNotFoundError:
+            return ErrorObservation(f'File not found: {filepath}')
+        except IsADirectoryError:
+            return ErrorObservation(
+                f'Path is a directory: {filepath}. You can only write to files'
+            )
+        except UnicodeDecodeError:
+            return ErrorObservation(f'File could not be decoded as utf-8: {filepath}')
+
+        # Attempt to handle file permissions
+        try:
+            if file_exists:
+                assert file_stat is not None
+                # restore the original file permissions if the file already exists
+                os.chmod(filepath, file_stat.st_mode)
+                os.chown(filepath, file_stat.st_uid, file_stat.st_gid)
+            else:
+                # set the new file permissions if the file is new
+                os.chmod(filepath, 0o664)
+                os.chown(filepath, self.user_id, self.user_id)
+        except PermissionError as e:
+            return ErrorObservation(
+                f'File {filepath} written, but failed to change ownership and permissions: {e}'
+            )
         return FileWriteObservation(content='', path=filepath)
 
+    async def edit(self, action: FileEditAction) -> Observation:
+        assert action.impl_source == FileEditSource.OH_ACI
+        result_str, (old_content, new_content) = _execute_file_editor(
+            self.file_editor,
+            command=action.command,
+            path=action.path,
+            file_text=action.file_text,
+            old_str=action.old_str,
+            new_str=action.new_str,
+            insert_line=action.insert_line,
+            enable_linting=False,
+        )
+
+        return FileEditObservation(
+            content=result_str,
+            path=action.path,
+            old_content=action.old_str,
+            new_content=action.new_str,
+            impl_source=FileEditSource.OH_ACI,
+            diff=get_diff(
+                old_contents=old_content or '',
+                new_contents=new_content or '',
+                filepath=action.path,
+            ),
+        )
+
     async def browse(self, action: BrowseURLAction) -> Observation:
+        await self._ensure_browser_ready()
         return await browse(action, self.browser)
 
     async def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
+        await self._ensure_browser_ready()
         return await browse(action, self.browser)
 
     def close(self):
-        self.bash_session.close()
-        self.browser.close()
+        self.memory_monitor.stop_monitoring()
+        if self.bash_session is not None:
+            self.bash_session.close()
+        if self.browser is not None:
+            self.browser.close()
 
 
 if __name__ == '__main__':
@@ -370,8 +530,6 @@ if __name__ == '__main__':
     )
     # example: python client.py 8000 --working-dir /workspace --plugins JupyterRequirement
     args = parser.parse_args()
-    os.environ['VSCODE_PORT'] = str(int(args.port) + 1)
-    assert check_port_available(int(os.environ['VSCODE_PORT']))
 
     plugins_to_load: list[Plugin] = []
     if args.plugins:
@@ -430,7 +588,9 @@ if __name__ == '__main__':
             try:
                 verify_api_key(request.headers.get('X-Session-API-Key'))
             except HTTPException as e:
-                return e
+                return JSONResponse(
+                    status_code=e.status_code, content={'detail': e.detail}
+                )
         response = await call_next(request)
         return response
 
@@ -460,9 +620,7 @@ if __name__ == '__main__':
             observation = await client.run_action(action)
             return event_to_dict(observation)
         except Exception as e:
-            logger.error(
-                f'Error processing command: {str(e)}', exc_info=True, stack_info=True
-            )
+            logger.error(f'Error while running /execute_action: {str(e)}')
             raise HTTPException(
                 status_code=500,
                 detail=traceback.format_exc(),
@@ -523,7 +681,7 @@ if __name__ == '__main__':
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get('/download_files')
-    async def download_file(path: str):
+    def download_file(path: str):
         logger.debug('Downloading files')
         try:
             if not os.path.isabs(path):
@@ -534,7 +692,7 @@ if __name__ == '__main__':
             if not os.path.exists(path):
                 raise HTTPException(status_code=404, detail='File not found')
 
-            with tempfile.TemporaryFile() as temp_zip:
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
                 with ZipFile(temp_zip, 'w') as zipf:
                     for root, _, files in os.walk(path):
                         for file in files:
@@ -542,15 +700,11 @@ if __name__ == '__main__':
                             zipf.write(
                                 file_path, arcname=os.path.relpath(file_path, path)
                             )
-                temp_zip.seek(0)  # Rewind the file to the beginning after writing
-                content = temp_zip.read()
-                # Good for small to medium-sized files. For very large files, streaming directly from the
-                # file chunks may be more memory-efficient.
-                zip_stream = io.BytesIO(content)
-                return StreamingResponse(
-                    content=zip_stream,
+                return FileResponse(
+                    path=temp_zip.name,
                     media_type='application/zip',
-                    headers={'Content-Disposition': f'attachment; filename={path}.zip'},
+                    filename=f'{os.path.basename(path)}.zip',
+                    background=BackgroundTask(lambda: os.unlink(temp_zip.name)),
                 )
 
         except Exception as e:
@@ -558,6 +712,8 @@ if __name__ == '__main__':
 
     @app.get('/alive')
     async def alive():
+        if client is None or not client.initialized:
+            return {'status': 'not initialized'}
         return {'status': 'ok'}
 
     # ================================
@@ -607,11 +763,11 @@ if __name__ == '__main__':
 
         # Get the full path of the requested directory
         if path is None:
-            full_path = client.initial_pwd
+            full_path = client.initial_cwd
         elif os.path.isabs(path):
             full_path = path
         else:
-            full_path = os.path.join(client.initial_pwd, path)
+            full_path = os.path.join(client.initial_cwd, path)
 
         if not os.path.exists(full_path):
             # if user just removed a folder, prevent server error 500 in UI
@@ -652,7 +808,7 @@ if __name__ == '__main__':
             return sorted_entries
 
         except Exception as e:
-            logger.error(f'Error listing files: {e}', exc_info=True)
+            logger.error(f'Error listing files: {e}')
             return []
 
     logger.debug(f'Starting action execution API on port {args.port}')

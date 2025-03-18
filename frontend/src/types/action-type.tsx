@@ -26,18 +26,15 @@ enum ActionType {
   // Delegate a (sub)task to another agent.
   DELEGATE = "delegate",
 
+  // Logs a thought.
+  THINK = "think",
+
   // If you're absolutely certain that you've completed your task and have tested your work,
   // use the finish action to stop working.
   FINISH = "finish",
 
   // Reject a request from user or another agent.
   REJECT = "reject",
-
-  // Adds a task to the plan.
-  ADD_TASK = "add_task",
-
-  // Updates a task in the plan.
-  MODIFY_TASK = "modify_task",
 
   // Changes the state of the agent, e.g. to paused or running
   CHANGE_AGENT_STATE = "change_agent_state",

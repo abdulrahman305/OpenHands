@@ -5,6 +5,7 @@ import { initReactI18next } from "react-i18next";
 
 export const AvailableLanguages = [
   { label: "English", value: "en" },
+  { label: "日本語", value: "ja" },
   { label: "简体中文", value: "zh-CN" },
   { label: "繁體中文", value: "zh-TW" },
   { label: "한국어", value: "ko-KR" },
@@ -25,6 +26,7 @@ i18n
   .init({
     fallbackLng: "en",
     debug: import.meta.env.NODE_ENV === "development",
+    load: "languageOnly",
   });
 
 export default i18n;

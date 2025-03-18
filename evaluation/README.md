@@ -20,6 +20,8 @@ To evaluate an agent, you can provide the agent's name to the `run_infer.py` pro
 ### Evaluating Different LLMs
 
 OpenHands in development mode uses `config.toml` to keep track of most configuration.
+**IMPORTANT: For evaluation, only the LLM section in `config.toml` will be used. Other configurations, such as `save_trajectory_path`, are not applied during evaluation.**
+
 Here's an example configuration file you can use to define and use multiple LLMs:
 
 ```toml
@@ -40,9 +42,11 @@ api_key = "XXX"
 temperature = 0.0
 ```
 
+For other configurations specific to evaluation, such as `save_trajectory_path`, these are typically set in the `get_config` function of the respective `run_infer.py` file for each benchmark.
+
 ## Supported Benchmarks
 
-The OpenHands evaluation harness supports a wide variety of benchmarks across [software engineering](#software-engineering), [web browsing](#web-browsing), and [miscellaneous assistance](#misc-assistance) tasks.
+The OpenHands evaluation harness supports a wide variety of benchmarks across [software engineering](#software-engineering), [web browsing](#web-browsing), [miscellaneous assistance](#misc-assistance), and [real-world](#real-world) tasks.
 
 ### Software Engineering
 
@@ -72,6 +76,10 @@ The OpenHands evaluation harness supports a wide variety of benchmarks across [s
 - Entity deduction Arena (EDA): [`evaluation/benchmarks/EDA`](./benchmarks/EDA)
 - ProofWriter: [`evaluation/benchmarks/logic_reasoning`](./benchmarks/logic_reasoning)
 - ScienceAgentBench: [`evaluation/benchmarks/scienceagentbench`](./benchmarks/scienceagentbench)
+
+### Real World
+
+- TheAgentCompany: [`evaluation/benchmarks/the_agent_company`](./benchmarks/the_agent_company)
 
 ## Result Visualization
 

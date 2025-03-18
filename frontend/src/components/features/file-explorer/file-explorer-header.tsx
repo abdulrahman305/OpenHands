@@ -7,21 +7,19 @@ interface FileExplorerHeaderProps {
   isOpen: boolean;
   onToggle: () => void;
   onRefreshWorkspace: () => void;
-  onUploadFile: () => void;
 }
 
 export function FileExplorerHeader({
   isOpen,
   onToggle,
   onRefreshWorkspace,
-  onUploadFile,
 }: FileExplorerHeaderProps) {
   const { t } = useTranslation();
 
   return (
     <div
       className={cn(
-        "sticky top-0 bg-neutral-800",
+        "sticky top-0 bg-base-secondary",
         "flex items-center",
         !isOpen ? "justify-center" : "justify-between",
       )}
@@ -35,7 +33,6 @@ export function FileExplorerHeader({
         isHidden={!isOpen}
         toggleHidden={onToggle}
         onRefresh={onRefreshWorkspace}
-        onUpload={onUploadFile}
       />
     </div>
   );

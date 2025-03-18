@@ -1,28 +1,31 @@
+import copy
+import json
 import os
+import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from functools import partial
+from typing import Callable
 
 import pandas as pd
-from swebench.harness.grading import get_eval_report
-from swebench.harness.run_evaluation import (
-    APPLY_PATCH_FAIL,
-    APPLY_PATCH_PASS,
-)
-from swebench.harness.test_spec import SWEbenchInstance, TestSpec, make_test_spec
-from swebench.harness.utils import load_swebench_dataset
+from tqdm import tqdm
 
+from evaluation.benchmarks.swe_bench.resource.mapping import (
+    get_instance_resource_factor,
+)
 from evaluation.benchmarks.swe_bench.run_infer import get_instance_docker_image
 from evaluation.utils.shared import (
     EvalMetadata,
     EvalOutput,
+    get_default_sandbox_config_for_eval,
     prepare_dataset,
     reset_logger_for_multiprocessing,
     run_evaluation,
 )
 from openhands.core.config import (
     AppConfig,
-    SandboxConfig,
+    LLMConfig,
     get_parser,
 )
 from openhands.core.logger import openhands_logger as logger
@@ -66,7 +69,7 @@ def process_git_patch(patch):
     return patch
 
 
-def get_config(instance: pd.Series) -> AppConfig:
+def get_config(metadata: EvalMetadata, instance: pd.Series) -> AppConfig:
     # We use a different instance image for the each instance of swe-bench eval
     base_container_image = get_instance_docker_image(instance['instance_id'])
     logger.info(
@@ -74,18 +77,16 @@ def get_config(instance: pd.Series) -> AppConfig:
         f'Please make sure this image exists. '
         f'Submit an issue on https://github.com/All-Hands-AI/OpenHands if you run into any issues.'
     )
+    sandbox_config = get_default_sandbox_config_for_eval()
+    sandbox_config.base_container_image = base_container_image
+    sandbox_config.remote_runtime_resource_factor = get_instance_resource_factor(
+        dataset_name=metadata.dataset,
+        instance_id=instance['instance_id'],
+    )
     config = AppConfig(
         run_as_openhands=False,
-        runtime=os.environ.get('RUNTIME', 'eventstream'),
-        sandbox=SandboxConfig(
-            base_container_image=base_container_image,
-            use_host_network=False,
-            # large enough timeout, since some testcases take very long to run
-            timeout=1800,
-            api_key=os.environ.get('ALLHANDS_API_KEY', None),
-            remote_runtime_api_url=os.environ.get('SANDBOX_REMOTE_RUNTIME_API_URL'),
-            remote_runtime_init_timeout=3600,
-        ),
+        runtime=os.environ.get('RUNTIME', 'docker'),
+        sandbox=sandbox_config,
         # do not mount workspace
         workspace_base=None,
         workspace_mount_path=None,
@@ -93,11 +94,22 @@ def get_config(instance: pd.Series) -> AppConfig:
     return config
 
 
+@dataclass
+class ConditionalImports:
+    """We instantiate the values in this dataclass differently if we're evaluating SWE-bench or SWE-Gym."""
+
+    get_eval_report: Callable
+    APPLY_PATCH_FAIL: str
+    APPLY_PATCH_PASS: str
+
+
 def process_instance(
     instance: pd.Series,
     metadata: EvalMetadata,
     reset_logger: bool = True,
     log_dir: str | None = None,
+    runtime_failure_count: int = 0,
+    conditional_imports: ConditionalImports | None = None,
 ) -> EvalOutput:
     """
     Evaluate agent performance on a SWE-bench problem instance.
@@ -109,9 +121,18 @@ def process_instance(
         log_dir (str | None, default=None): Path to directory where log files will be written. Must
         be provided if `reset_logger` is set.
 
+        conditional_imports: A dataclass containing values that are imported differently based on
+        whether we're evaluating SWE-bench or SWE-Gym.
+
     Raises:
         AssertionError: if the `reset_logger` flag is set without a provided log directory.
+
+        AssertionError: if `conditional_imports` is not provided.
     """
+    assert (
+        conditional_imports is not None
+    ), 'conditional_imports must be provided to run process_instance using multiprocessing'
+
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
         assert (
@@ -122,10 +143,10 @@ def process_instance(
     else:
         logger.info(f'Starting evaluation for instance {instance.instance_id}.')
 
-    config = get_config(instance)
+    config = get_config(metadata, instance)
     instance_id = instance.instance_id
     model_patch = instance['model_patch']
-    test_spec: TestSpec = instance['test_spec']
+    test_spec = instance['test_spec']
     logger.info(f'Starting evaluation for instance {instance_id}.')
 
     if 'test_result' not in instance.keys():
@@ -146,48 +167,65 @@ def process_instance(
             metadata=metadata,
         )
 
-    runtime = create_runtime(config)
-    call_async_from_sync(runtime.connect)
-    # Get patch and save it to /tmp/patch.diff
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Patch file
-        patch_file_path = os.path.join(temp_dir, 'patch.diff')
-        with open(patch_file_path, 'w') as f:
-            f.write(model_patch)
-        runtime.copy_to(patch_file_path, '/tmp')
-        # Eval script
-        eval_script_path = os.path.join(temp_dir, 'eval.sh')
-        with open(eval_script_path, 'w') as f:
-            f.write(test_spec.eval_script)
-        runtime.copy_to(eval_script_path, '/tmp')
-
-    # Set +x
-    action = CmdRunAction(command='chmod +x /tmp/eval.sh')
-    action.timeout = 600
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert obs.exit_code == 0
-
-    # Apply patch
-    exec_command = (
-        'cd /testbed && '
-        "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
-        "(echo 'Failed to apply patch with git apply, trying with patch command...' && "
-        "(patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
-        "echo 'APPLY_PATCH_FAIL')))"
+    # Increase resource_factor with increasing attempt_id
+    if runtime_failure_count > 0:
+        config.sandbox.remote_runtime_resource_factor = min(
+            config.sandbox.remote_runtime_resource_factor * (2**runtime_failure_count),
+            8,
+        )
+        logger.warning(
+            f'This is the {runtime_failure_count + 1}th attempt for instance {instance.instance_id}, setting resource factor to {config.sandbox.remote_runtime_resource_factor}'
+        )
+    metadata = copy.deepcopy(metadata)
+    metadata.details['runtime_failure_count'] = runtime_failure_count
+    metadata.details['remote_runtime_resource_factor'] = (
+        config.sandbox.remote_runtime_resource_factor
     )
-    action = CmdRunAction(command=exec_command, keep_prompt=False)
-    action.timeout = 600
-    obs = runtime.run_action(action)
-    assert isinstance(obs, CmdOutputObservation)
-    apply_patch_output = obs.content
-    assert isinstance(apply_patch_output, str)
-    instance['test_result']['apply_patch_output'] = apply_patch_output
 
     try:
+        runtime = create_runtime(config)
+        call_async_from_sync(runtime.connect)
+        # Get patch and save it to /tmp/patch.diff
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Patch file
+            patch_file_path = os.path.join(temp_dir, 'patch.diff')
+            with open(patch_file_path, 'w') as f:
+                f.write(model_patch)
+            runtime.copy_to(patch_file_path, '/tmp')
+            # Eval script
+            eval_script_path = os.path.join(temp_dir, 'eval.sh')
+            with open(eval_script_path, 'w') as f:
+                f.write(test_spec.eval_script)
+            runtime.copy_to(eval_script_path, '/tmp')
+
+        # Set +x
+        action = CmdRunAction(command='chmod +x /tmp/eval.sh')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert obs.exit_code == 0
+
+        # Apply patch
+        exec_command = (
+            'cd /testbed && '
+            "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
+            "(echo 'Failed to apply patch with git apply, trying with patch command...' && "
+            "(patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
+            "echo 'APPLY_PATCH_FAIL')))"
+        )
+        action = CmdRunAction(command=exec_command)
+        action.set_hard_timeout(600)
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        apply_patch_output = obs.content
+        assert isinstance(apply_patch_output, str)
+        instance['test_result']['apply_patch_output'] = apply_patch_output
+
         if 'APPLY_PATCH_FAIL' in apply_patch_output:
-            logger.info(f'[{instance_id}] {APPLY_PATCH_FAIL}:\n{apply_patch_output}')
+            logger.info(
+                f'[{instance_id}] {conditional_imports.APPLY_PATCH_FAIL}:\n{apply_patch_output}'
+            )
             instance['test_result']['report']['failed_apply_patch'] = True
 
             return EvalOutput(
@@ -196,14 +234,14 @@ def process_instance(
                 metadata=metadata,
             )
         elif 'APPLY_PATCH_PASS' in apply_patch_output:
-            logger.info(f'[{instance_id}] {APPLY_PATCH_PASS}:\n{apply_patch_output}')
+            logger.info(
+                f'[{instance_id}] {conditional_imports.APPLY_PATCH_PASS}:\n{apply_patch_output}'
+            )
 
             # Run eval script in background and save output to log file
             log_file = '/tmp/eval_output.log'
-            action = CmdRunAction(
-                command=f'/tmp/eval.sh > {log_file} 2>&1 & echo $!', keep_prompt=False
-            )
-            action.timeout = 60  # Short timeout just to get the process ID
+            action = CmdRunAction(command=f'/tmp/eval.sh > {log_file} 2>&1 & echo $!')
+            action.set_hard_timeout(300)  # Short timeout just to get the process ID
             obs = runtime.run_action(action)
 
             if isinstance(obs, CmdOutputObservation) and obs.exit_code == 0:
@@ -224,9 +262,9 @@ def process_instance(
                         instance['test_result']['report']['test_timeout'] = True
                         break
                     check_action = CmdRunAction(
-                        command=f'ps -p {pid} > /dev/null; echo $?', keep_prompt=False
+                        command=f'ps -p {pid} > /dev/null; echo $?'
                     )
-                    check_action.timeout = 60
+                    check_action.set_hard_timeout(300)
                     check_obs = runtime.run_action(check_action)
                     if (
                         isinstance(check_obs, CmdOutputObservation)
@@ -242,8 +280,8 @@ def process_instance(
                     time.sleep(30)  # Wait for 30 seconds before checking again
 
                 # Read the log file
-                cat_action = CmdRunAction(command=f'cat {log_file}', keep_prompt=False)
-                cat_action.timeout = 300
+                cat_action = CmdRunAction(command=f'cat {log_file}')
+                cat_action.set_hard_timeout(300)
                 cat_obs = runtime.run_action(cat_action)
 
                 # Grade answer
@@ -264,14 +302,20 @@ def process_instance(
                         with open(test_output_path, 'w') as f:
                             f.write(test_output)
                         try:
-                            _report = get_eval_report(
+                            extra_kwargs = {}
+                            if 'SWE-Gym' in metadata.dataset:
+                                # SWE-Gym uses a different version of the package, hence a different eval report argument
+                                extra_kwargs['log_path'] = test_output_path
+                            else:
+                                extra_kwargs['test_log_path'] = test_output_path
+                            _report = conditional_imports.get_eval_report(
                                 test_spec=test_spec,
                                 prediction={
                                     'model_patch': model_patch,
                                     'instance_id': instance_id,
                                 },
-                                log_path=test_output_path,
                                 include_tests_status=True,
+                                **extra_kwargs,
                             )
                             report = _report[instance_id]
                             logger.info(
@@ -330,6 +374,29 @@ if __name__ == '__main__':
     )
     args, _ = parser.parse_known_args()
 
+    if 'SWE-Gym' in args.dataset:
+        from swegym.harness.grading import get_eval_report
+        from swegym.harness.run_evaluation import (
+            APPLY_PATCH_FAIL,
+            APPLY_PATCH_PASS,
+        )
+        from swegym.harness.test_spec import (
+            SWEbenchInstance,
+            make_test_spec,
+        )
+        from swegym.harness.utils import load_swebench_dataset
+    else:  # Newer version of SWE-Bench have different import paths
+        from swebench.harness.grading import get_eval_report
+        from swebench.harness.run_evaluation import (
+            APPLY_PATCH_FAIL,
+            APPLY_PATCH_PASS,
+        )
+        from swebench.harness.test_spec.test_spec import (
+            SWEbenchInstance,
+            make_test_spec,
+        )
+        from swebench.harness.utils import load_swebench_dataset
+
     # Load SWE-Bench dataset
     full_dataset: list[SWEbenchInstance] = load_swebench_dataset(
         args.dataset, args.split
@@ -343,7 +410,14 @@ if __name__ == '__main__':
 
     # Load predictions
     assert args.input_file.endswith('.jsonl'), 'Input file must be a jsonl file.'
-    predictions = pd.read_json(args.input_file, lines=True)
+    required_fields = ['instance_id', 'model_patch', 'test_result']
+    with open(args.input_file) as f:
+        predictions = pd.DataFrame.from_records(
+            [
+                {k: v for k, v in json.loads(line).items() if k in required_fields}
+                for line in tqdm(f, desc='Loading predictions')
+            ]
+        )
     assert (
         'instance_id' in predictions.columns
     ), 'Input file must contain instance_id column.'
@@ -387,11 +461,35 @@ if __name__ == '__main__':
         with open(metadata_filepath, 'r') as metadata_file:
             data = metadata_file.read()
             metadata = EvalMetadata.model_validate_json(data)
+    else:
+        # Initialize with a dummy metadata when file doesn't exist
+        metadata = EvalMetadata(
+            agent_class='dummy_agent',  # Placeholder agent class
+            llm_config=LLMConfig(model='dummy_model'),  # Minimal LLM config
+            max_iterations=1,  # Minimal iterations
+            eval_output_dir=os.path.dirname(
+                args.input_file
+            ),  # Use input file dir as output dir
+            start_time=time.strftime('%Y-%m-%d %H:%M:%S'),  # Current time
+            git_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'])
+            .decode('utf-8')
+            .strip(),  # Current commit
+            dataset=args.dataset,  # Dataset name from args
+            details={},
+        )
 
     # The evaluation harness constrains the signature of `process_instance_func` but we need to
     # pass extra information. Build a new function object to avoid issues with multiprocessing.
     process_instance_func = partial(
-        process_instance, log_dir=output_file.replace('.jsonl', '.logs')
+        process_instance,
+        log_dir=output_file.replace('.jsonl', '.logs'),
+        # We have to explicitly pass these imports to the process_instance function, otherwise
+        # they won't be available in the multiprocessing context.
+        conditional_imports=ConditionalImports(
+            get_eval_report=get_eval_report,
+            APPLY_PATCH_FAIL=APPLY_PATCH_FAIL,
+            APPLY_PATCH_PASS=APPLY_PATCH_PASS,
+        ),
     )
 
     run_evaluation(

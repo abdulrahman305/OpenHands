@@ -6,6 +6,7 @@ import time
 import docker
 
 from openhands import __version__ as oh_version
+from openhands.core.exceptions import AgentRuntimeBuildError
 from openhands.core.logger import RollingLogger
 from openhands.core.logger import openhands_logger as logger
 from openhands.runtime.builder.base import RuntimeBuilder
@@ -18,10 +19,34 @@ class DockerRuntimeBuilder(RuntimeBuilder):
 
         version_info = self.docker_client.version()
         server_version = version_info.get('Version', '').replace('-', '.')
-        if tuple(map(int, server_version.split('.')[:2])) < (18, 9):
-            raise RuntimeError('Docker server version must be >= 18.09 to use BuildKit')
+        self.is_podman = (
+            version_info.get('Components')[0].get('Name').startswith('Podman')
+        )
+        if (
+            tuple(map(int, server_version.split('.')[:2])) < (18, 9)
+            and not self.is_podman
+        ):
+            raise AgentRuntimeBuildError(
+                'Docker server version must be >= 18.09 to use BuildKit'
+            )
+
+        if self.is_podman and tuple(map(int, server_version.split('.')[:2])) < (4, 9):
+            raise AgentRuntimeBuildError('Podman server version must be >= 4.9.0')
 
         self.rolling_logger = RollingLogger(max_lines=10)
+
+    @staticmethod
+    def check_buildx(is_podman: bool = False):
+        """Check if Docker Buildx is available"""
+        try:
+            result = subprocess.run(
+                ['docker' if not is_podman else 'podman', 'buildx', 'version'],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
+        except FileNotFoundError:
+            return False
 
     def build(
         self,
@@ -44,7 +69,7 @@ class DockerRuntimeBuilder(RuntimeBuilder):
             str: The name of the built Docker image.
 
         Raises:
-            RuntimeError: If the Docker server version is incompatible or if the build process fails.
+            AgentRuntimeBuildError: If the Docker server version is incompatible or if the build process fails.
 
         Note:
             This method uses Docker BuildKit for improved build performance and caching capabilities.
@@ -53,16 +78,56 @@ class DockerRuntimeBuilder(RuntimeBuilder):
         """
         self.docker_client = docker.from_env()
         version_info = self.docker_client.version()
-        server_version = version_info.get('Version', '').replace('-', '.')
-        if tuple(map(int, server_version.split('.'))) < (18, 9):
-            raise RuntimeError('Docker server version must be >= 18.09 to use BuildKit')
+        server_version = version_info.get('Version', '').split('+')[0].replace('-', '.')
+        self.is_podman = (
+            version_info.get('Components')[0].get('Name').startswith('Podman')
+        )
+        if tuple(map(int, server_version.split('.'))) < (18, 9) and not self.is_podman:
+            raise AgentRuntimeBuildError(
+                'Docker server version must be >= 18.09 to use BuildKit'
+            )
+
+        if self.is_podman and tuple(map(int, server_version.split('.'))) < (4, 9):
+            raise AgentRuntimeBuildError('Podman server version must be >= 4.9.0')
+
+        if not DockerRuntimeBuilder.check_buildx(self.is_podman):
+            # when running openhands in a container, there might not be a "docker"
+            # binary available, in which case we need to download docker binary.
+            # since the official openhands app image is built from debian, we use
+            # debian way to install docker binary
+            logger.info(
+                'No docker binary available inside openhands-app container, trying to download online...'
+            )
+            commands = [
+                'apt-get update',
+                'apt-get install -y ca-certificates curl gnupg',
+                'install -m 0755 -d /etc/apt/keyrings',
+                'curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc',
+                'chmod a+r /etc/apt/keyrings/docker.asc',
+                'echo \
+                  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+                  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                  tee /etc/apt/sources.list.d/docker.list > /dev/null',
+                'apt-get update',
+                'apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin',
+            ]
+            for cmd in commands:
+                try:
+                    subprocess.run(
+                        cmd, shell=True, check=True, stdout=subprocess.DEVNULL
+                    )
+                except subprocess.CalledProcessError as e:
+                    logger.error(f'Image build failed:\n{e}')
+                    logger.error(f'Command output:\n{e.output}')
+                    raise
+            logger.info('Downloaded and installed docker binary')
 
         target_image_hash_name = tags[0]
         target_image_repo, target_image_source_tag = target_image_hash_name.split(':')
         target_image_tag = tags[1].split(':')[1] if len(tags) > 1 else None
 
         buildx_cmd = [
-            'docker',
+            'docker' if not self.is_podman else 'podman',
             'buildx',
             'build',
             '--progress=plain',
@@ -91,7 +156,7 @@ class DockerRuntimeBuilder(RuntimeBuilder):
         buildx_cmd.append(path)  # must be last!
 
         self.rolling_logger.start(
-            '================ DOCKER BUILD STARTED ================'
+            f'================ {buildx_cmd[0].upper()} BUILD STARTED ================'
         )
 
         try:
@@ -120,8 +185,12 @@ class DockerRuntimeBuilder(RuntimeBuilder):
                 )
 
         except subprocess.CalledProcessError as e:
-            logger.error(f'Image build failed:\n{e}')
+            logger.error(f'Image build failed:\n{e}')  # TODO: {e} is empty
             logger.error(f'Command output:\n{e.output}')
+            if self.rolling_logger.is_enabled():
+                logger.error(
+                    'Docker build output:\n' + self.rolling_logger.all_lines
+                )  # Show the error
             raise
 
         except subprocess.TimeoutExpired:
@@ -154,7 +223,7 @@ class DockerRuntimeBuilder(RuntimeBuilder):
         # Check if the image is built successfully
         image = self.docker_client.images.get(target_image_hash_name)
         if image is None:
-            raise RuntimeError(
+            raise AgentRuntimeBuildError(
                 f'Build failed: Image {target_image_hash_name} not found'
             )
 

@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
+import type { Message } from "#/message";
 
 import { ActionSecurityRisk } from "#/state/security-analyzer-slice";
 import {
@@ -19,6 +20,7 @@ const HANDLED_ACTIONS: OpenHandsEventType[] = [
   "write",
   "read",
   "browse",
+  "edit",
 ];
 
 function getRiskText(risk: ActionSecurityRisk) {
@@ -72,7 +74,7 @@ export const chatSlice = createSlice({
       state.messages.push(message);
     },
 
-    addAssistantMessage(state, action: PayloadAction<string>) {
+    addAssistantMessage(state: SliceState, action: PayloadAction<string>) {
       const message: Message = {
         type: "thought",
         sender: "assistant",
@@ -84,7 +86,10 @@ export const chatSlice = createSlice({
       state.messages.push(message);
     },
 
-    addAssistantAction(state, action: PayloadAction<OpenHandsAction>) {
+    addAssistantAction(
+      state: SliceState,
+      action: PayloadAction<OpenHandsAction>,
+    ) {
       const actionID = action.payload.action;
       if (!HANDLED_ACTIONS.includes(actionID)) {
         return;
@@ -92,7 +97,7 @@ export const chatSlice = createSlice({
       const translationID = `ACTION_MESSAGE$${actionID.toUpperCase()}`;
       let text = "";
       if (actionID === "run") {
-        text = `\`${action.payload.args.command}\``;
+        text = `Command:\n\`${action.payload.args.command}\``;
       } else if (actionID === "run_ipython") {
         text = `\`\`\`\n${action.payload.args.code}\n\`\`\``;
       } else if (actionID === "write") {
@@ -101,8 +106,6 @@ export const chatSlice = createSlice({
           content = `${content.slice(0, MAX_CONTENT_LENGTH)}...`;
         }
         text = `${action.payload.args.path}\n${content}`;
-      } else if (actionID === "read") {
-        text = action.payload.args.path;
       } else if (actionID === "browse") {
         text = `Browsing ${action.payload.args.url}`;
       }
@@ -112,6 +115,8 @@ export const chatSlice = createSlice({
         ) {
           text += `\n\n${getRiskText(action.payload.args.security_risk as unknown as ActionSecurityRisk)}`;
         }
+      } else if (actionID === "think") {
+        text = action.payload.args.thought;
       }
       const message: Message = {
         type: "action",
@@ -126,7 +131,7 @@ export const chatSlice = createSlice({
     },
 
     addAssistantObservation(
-      state,
+      state: SliceState,
       observation: PayloadAction<OpenHandsObservation>,
     ) {
       const observationID = observation.payload.observation;
@@ -145,13 +150,25 @@ export const chatSlice = createSlice({
       // Set success property based on observation type
       if (observationID === "run") {
         const commandObs = observation.payload as CommandObservation;
-        causeMessage.success = commandObs.extras.exit_code === 0;
+        causeMessage.success = commandObs.extras.metadata.exit_code === 0;
       } else if (observationID === "run_ipython") {
         // For IPython, we consider it successful if there's no error message
         const ipythonObs = observation.payload as IPythonObservation;
-        causeMessage.success = !ipythonObs.message
+        causeMessage.success = !ipythonObs.content
           .toLowerCase()
-          .includes("error");
+          .includes("error:");
+      } else if (observationID === "read" || observationID === "edit") {
+        // For read/edit operations, we consider it successful if there's content and no error
+
+        if (observation.payload.extras.impl_source === "oh_aci") {
+          causeMessage.success =
+            observation.payload.content.length > 0 &&
+            !observation.payload.content.startsWith("ERROR:\n");
+        } else {
+          causeMessage.success =
+            observation.payload.content.length > 0 &&
+            !observation.payload.content.toLowerCase().includes("error:");
+        }
       }
 
       if (observationID === "run" || observationID === "run_ipython") {
@@ -159,8 +176,18 @@ export const chatSlice = createSlice({
         if (content.length > MAX_CONTENT_LENGTH) {
           content = `${content.slice(0, MAX_CONTENT_LENGTH)}...`;
         }
-        content = `\`\`\`\n${content}\n\`\`\``;
+        content = `${
+          causeMessage.content
+        }\n\nOutput:\n\`\`\`\n${content.trim() || "[Command finished execution with no output]"}\n\`\`\``;
         causeMessage.content = content; // Observation content includes the action
+      } else if (observationID === "read") {
+        causeMessage.content = `\`\`\`\n${observation.payload.content}\n\`\`\``; // Content is already truncated by the ACI
+      } else if (observationID === "edit") {
+        if (causeMessage.success) {
+          causeMessage.content = `\`\`\`diff\n${observation.payload.extras.diff}\n\`\`\``; // Content is already truncated by the ACI
+        } else {
+          causeMessage.content = observation.payload.content;
+        }
       } else if (observationID === "browse") {
         let content = `**URL:** ${observation.payload.extras.url}\n`;
         if (observation.payload.extras.error) {
@@ -175,7 +202,7 @@ export const chatSlice = createSlice({
     },
 
     addErrorMessage(
-      state,
+      state: SliceState,
       action: PayloadAction<{ id?: string; message: string }>,
     ) {
       const { id, message } = action.payload;
@@ -188,7 +215,7 @@ export const chatSlice = createSlice({
       });
     },
 
-    clearMessages(state) {
+    clearMessages(state: SliceState) {
       state.messages = [];
     },
   },

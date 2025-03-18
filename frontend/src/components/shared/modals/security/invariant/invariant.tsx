@@ -4,7 +4,7 @@ import { IoAlertCircle } from "react-icons/io5";
 import { useTranslation } from "react-i18next";
 import { Editor, Monaco } from "@monaco-editor/react";
 import { editor } from "monaco-editor";
-import { Button, Select, SelectItem } from "@nextui-org/react";
+import { Button, Select, SelectItem } from "@heroui/react";
 import { useMutation } from "@tanstack/react-query";
 import { RootState } from "#/store";
 import {
@@ -24,7 +24,7 @@ import { useGetTraces } from "#/hooks/query/use-get-traces";
 
 type SectionType = "logs" | "policy" | "settings";
 
-function SecurityInvariant(): JSX.Element {
+function SecurityInvariant() {
   const { t } = useTranslation();
   const { logs } = useSelector((state: RootState) => state.securityAnalyzer);
 
@@ -122,12 +122,12 @@ function SecurityInvariant(): JSX.Element {
     [],
   );
 
-  const sections: { [key in SectionType]: JSX.Element } = {
+  const sections: Record<SectionType, React.ReactNode> = {
     logs: (
       <>
         <div className="flex justify-between items-center border-b border-neutral-600 mb-4 p-4">
           <h2 className="text-2xl">{t(I18nKey.INVARIANT$LOG_LABEL)}</h2>
-          <Button onClick={() => exportTraces()} className="bg-neutral-700">
+          <Button onPress={() => exportTraces()} className="bg-tertiary">
             {t(I18nKey.INVARIANT$EXPORT_TRACE_LABEL)}
           </Button>
         </div>
@@ -161,8 +161,8 @@ function SecurityInvariant(): JSX.Element {
         <div className="flex justify-between items-center border-b border-neutral-600 mb-4 p-4">
           <h2 className="text-2xl">{t(I18nKey.INVARIANT$POLICY_LABEL)}</h2>
           <Button
-            className="bg-neutral-700"
-            onClick={() => updatePolicy({ policy })}
+            className="bg-tertiary"
+            onPress={() => updatePolicy({ policy })}
           >
             {t(I18nKey.INVARIANT$UPDATE_POLICY_LABEL)}
           </Button>
@@ -183,8 +183,8 @@ function SecurityInvariant(): JSX.Element {
         <div className="flex justify-between items-center border-b border-neutral-600 mb-4 p-4">
           <h2 className="text-2xl">{t(I18nKey.INVARIANT$SETTINGS_LABEL)}</h2>
           <Button
-            className="bg-neutral-700"
-            onClick={() => updateRiskSeverity({ riskSeverity: selectedRisk })}
+            className="bg-tertiary"
+            onPress={() => updateRiskSeverity({ riskSeverity: selectedRisk })}
           >
             {t(I18nKey.INVARIANT$UPDATE_SETTINGS_LABEL)}
           </Button>
@@ -247,7 +247,7 @@ function SecurityInvariant(): JSX.Element {
 
   return (
     <div className="flex flex-1 w-full h-full">
-      <div className="w-60 bg-neutral-800 border-r border-r-neutral-600 p-4 flex-shrink-0">
+      <div className="w-60 bg-base-secondary border-r border-r-neutral-600 p-4 flex-shrink-0">
         <div className="text-center mb-2">
           <InvariantLogoIcon className="mx-auto mb-1" />
           <b>{t(I18nKey.INVARIANT$INVARIANT_ANALYZER_LABEL)}</b>
@@ -285,7 +285,7 @@ function SecurityInvariant(): JSX.Element {
           </div>
         </ul>
       </div>
-      <div className="flex flex-col min-h-0 w-full overflow-y-auto bg-neutral-900">
+      <div className="flex flex-col min-h-0 w-full overflow-y-auto bg-base">
         {sections[activeSection as SectionType]}
       </div>
     </div>

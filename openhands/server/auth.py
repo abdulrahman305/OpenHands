@@ -1,39 +1,35 @@
-import jwt
-from jwt.exceptions import InvalidTokenError
+from fastapi import Request
+from pydantic import SecretStr
 
-from openhands.core.logger import openhands_logger as logger
-
-
-def get_sid_from_token(token: str, jwt_secret: str) -> str:
-    """Retrieves the session id from a JWT token.
-
-    Parameters:
-        token (str): The JWT token from which the session id is to be extracted.
-
-    Returns:
-        str: The session id if found and valid, otherwise an empty string.
-    """
-    try:
-        # Decode the JWT using the specified secret and algorithm
-        payload = jwt.decode(token, jwt_secret, algorithms=['HS256'])
-
-        # Ensure the payload contains 'sid'
-        if 'sid' in payload:
-            return payload['sid']
-        else:
-            logger.error('SID not found in token')
-            return ''
-    except InvalidTokenError:
-        logger.error('Invalid token')
-    except Exception as e:
-        logger.exception('Unexpected error decoding token: %s', e)
-    return ''
+from openhands.integrations.provider import PROVIDER_TOKEN_TYPE, ProviderType
 
 
-def sign_token(payload: dict[str, object], jwt_secret: str) -> str:
-    """Signs a JWT token."""
-    # payload = {
-    #     "sid": sid,
-    #     # "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
-    # }
-    return jwt.encode(payload, jwt_secret, algorithm='HS256')
+def get_provider_tokens(request: Request) -> PROVIDER_TOKEN_TYPE | None:
+    """Get GitHub token from request state. For backward compatibility."""
+    return getattr(request.state, 'provider_tokens', None)
+
+
+def get_access_token(request: Request) -> SecretStr | None:
+    return getattr(request.state, 'access_token', None)
+
+
+def get_user_id(request: Request) -> str | None:
+    return getattr(request.state, 'user_id', None)
+
+
+def get_github_token(request: Request) -> SecretStr | None:
+    provider_tokens = get_provider_tokens(request)
+
+    if provider_tokens and ProviderType.GITHUB in provider_tokens:
+        return provider_tokens[ProviderType.GITHUB].token
+
+    return None
+
+
+def get_github_user_id(request: Request) -> str | None:
+    provider_tokens = get_provider_tokens(request)
+
+    if provider_tokens and ProviderType.GITHUB in provider_tokens:
+        return provider_tokens[ProviderType.GITHUB].user_id
+
+    return None

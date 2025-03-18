@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -eo pipefail
 
 source "evaluation/utils/version_control.sh"
@@ -35,7 +35,7 @@ echo "MODEL_CONFIG: $MODEL_CONFIG"
 COMMAND="poetry run python evaluation/benchmarks/scienceagentbench/run_infer.py \
   --agent-cls $AGENT \
   --llm-config $MODEL_CONFIG \
-  --use_knowledge $USE_KNOWLEDGE \
+  --use-knowledge $USE_KNOWLEDGE \
   --max-iterations 30 \
   --eval-num-workers $NUM_WORKERS \
   --eval-note $OPENHANDS_VERSION" \
