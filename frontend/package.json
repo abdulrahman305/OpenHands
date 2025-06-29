@@ -9,8 +9,8 @@
   "dependencies": {
     "@heroui/react": "2.7.4",
     "@monaco-editor/react": "^4.7.0-rc.0",
-    "@react-router/node": "^7.3.0",
-    "@react-router/serve": "^7.3.0",
+    "@react-router/node": "^7.6.3",
+    "@react-router/serve": "^7.6.3",
     "@react-types/shared": "^3.28.0",
     "@reduxjs/toolkit": "^2.6.0",
     "@stripe/react-stripe-js": "^3.3.0",
