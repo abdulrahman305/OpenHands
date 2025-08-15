@@ -1,11 +1,15 @@
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 
+from openhands.llm.tool_names import STR_REPLACE_EDITOR_TOOL_NAME
+
 _DETAILED_STR_REPLACE_EDITOR_DESCRIPTION = """Custom editing tool for viewing, creating and editing files in plain-text format
 * State is persistent across command calls and discussions with the user
-* If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
+* If `path` is a text file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
+* The following binary file extensions can be viewed in Markdown format: [".xlsx", ".pptx", ".wav", ".mp3", ".m4a", ".flac", ".pdf", ".docx"]. IT DOES NOT HANDLE IMAGES.
 * The `create` command cannot be used if the specified `path` already exists as a file
 * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
 * The `undo_edit` command will revert the last edit made to the file at `path`
+* This tool can be used for creating and editing files in plain-text format.
 
 
 Before using this tool:
@@ -31,7 +35,7 @@ CRITICAL REQUIREMENTS FOR USING THIS TOOL:
 Remember: when making multiple file edits in a row to the same file, you should prefer to send all edits in a single message with multiple calls to this tool, rather than multiple messages with a single call each.
 """
 
-_SIMPLIFIED_STR_REPLACE_EDITOR_DESCRIPTION = """Custom editing tool for viewing, creating and editing files in plain-text format
+_SHORT_STR_REPLACE_EDITOR_DESCRIPTION = """Custom editing tool for viewing, creating and editing files in plain-text format
 * State is persistent across command calls and discussions with the user
 * If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
 * The `create` command cannot be used if the specified `path` already exists as a file
@@ -45,17 +49,17 @@ Notes for using the `str_replace` command:
 
 
 def create_str_replace_editor_tool(
-    use_simplified_description: bool = False,
+    use_short_description: bool = False,
 ) -> ChatCompletionToolParam:
     description = (
-        _SIMPLIFIED_STR_REPLACE_EDITOR_DESCRIPTION
-        if use_simplified_description
+        _SHORT_STR_REPLACE_EDITOR_DESCRIPTION
+        if use_short_description
         else _DETAILED_STR_REPLACE_EDITOR_DESCRIPTION
     )
     return ChatCompletionToolParam(
         type='function',
         function=ChatCompletionToolParamFunctionChunk(
-            name='str_replace_editor',
+            name=STR_REPLACE_EDITOR_TOOL_NAME,
             description=description,
             parameters={
                 'type': 'object',

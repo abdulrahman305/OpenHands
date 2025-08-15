@@ -25,7 +25,7 @@ from evaluation.utils.shared import (
 from openhands.controller.state.state import State
 from openhands.core.config import (
     AgentConfig,
-    AppConfig,
+    OpenHandsConfig,
     get_llm_config_arg,
     parse_arguments,
 )
@@ -61,10 +61,10 @@ AGENT_CLS_TO_INST_SUFFIX = {
 
 def get_config(
     metadata: EvalMetadata,
-) -> AppConfig:
+) -> OpenHandsConfig:
     sandbox_config = get_default_sandbox_config_for_eval()
     sandbox_config.base_container_image = 'python:3.12-bookworm'
-    config = AppConfig(
+    config = OpenHandsConfig(
         default_agent=metadata.agent_class,
         run_as_openhands=False,
         runtime='docker',
@@ -79,8 +79,8 @@ def get_config(
     agent_config.enable_prompt_extensions = False
     agent_config = AgentConfig(
         function_calling=False,
-        codeact_enable_jupyter=True,
-        codeact_enable_browsing_delegate=True,
+        enable_jupyter=True,
+        enable_browsing=True,
     )
     config.set_agent_config(agent_config)
     return config
@@ -89,8 +89,7 @@ def get_config(
 def get_dv_query_for_real(
     datasets, question, domain_knowledge=None, workflow_tags=None
 ):
-    """
-    Prepare a structured query for the agent to execute on the specified datasets.
+    """Prepare a structured query for the agent to execute on the specified datasets.
 
     This function constructs a query by compiling metadata from the provided datasets, along with any relevant domain knowledge and workflow tags.
 
@@ -104,7 +103,6 @@ def get_dv_query_for_real(
         query_to_dv: Query to be run on the dataset
         dataset_meta: Metadata of the dataset
     """
-
     dataset_meta = ''
     for dataset_metadata in datasets:
         dataset_meta += 'Dataset name: ' + dataset_metadata['name']
@@ -140,12 +138,11 @@ def get_dv_query_for_real(
 
 
 def initialize_runtime(runtime: Runtime, data_files: list[str]):
-    """
-    Initialize the runtime for the agent.
+    """Initialize the runtime for the agent.
 
     This function is called before the runtime is used to run the agent.
     """
-    logger.info(f"{'-' * 50} BEGIN Runtime Initialization Fn {'-' * 50}")
+    logger.info(f'{"-" * 50} BEGIN Runtime Initialization Fn {"-" * 50}')
     obs: CmdOutputObservation
 
     action = CmdRunAction(command='mkdir -p /workspace')
@@ -170,7 +167,7 @@ def initialize_runtime(runtime: Runtime, data_files: list[str]):
         obs = runtime.run_action(action)
         assert obs.exit_code == 0
 
-    logger.info(f"{'-' * 50} END Runtime Initialization Fn {'-' * 50}")
+    logger.info(f'{"-" * 50} END Runtime Initialization Fn {"-" * 50}')
 
 
 def get_last_agent_finish_action(state: State) -> AgentFinishAction:
@@ -231,8 +228,7 @@ def process_instance(
     metadata: EvalMetadata,
     reset_logger: bool = True,
 ):
-    """
-    Process and evaluate a single instance of the dataset.
+    """Process and evaluate a single instance of the dataset.
 
     This function executes the OpenHands agent
     for a specific instance of the dataset. It retrieves
@@ -247,7 +243,6 @@ def process_instance(
     Returns:
         output: EvalOutput object
     """
-
     config = get_config(metadata)
 
     # Setup the logger properly, so you can run
@@ -356,8 +351,7 @@ def list_csv_files(list_of_datasets):
 
 
 def create_dataset(repo_location: str, split: str = 'test'):
-    """
-    Create a dataset from the discoverybench repository
+    """Create a dataset from the discoverybench repository
     by walking through the repository and extracting metadata
     from the metadata_{}.json files
 
@@ -368,7 +362,6 @@ def create_dataset(repo_location: str, split: str = 'test'):
     Returns:
         df: DataFrame containing the dataset instances
     """
-
     data_dict = {}
 
     data_location = os.path.join(repo_location, 'discoverybench', 'real', split)

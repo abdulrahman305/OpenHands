@@ -3,14 +3,14 @@ from types import MappingProxyType
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from openhands.events.action.commands import CmdRunAction
 from openhands.integrations.provider import (
     ProviderHandler,
     ProviderToken,
     ProviderType,
-    SecretStore,
 )
-from openhands.server.routes.settings import convert_to_settings
-from openhands.server.settings import POSTSettingsModel, Settings
+from openhands.storage.data_models.settings import Settings
+from openhands.storage.data_models.user_secrets import UserSecrets
 
 
 def test_provider_token_immutability():
@@ -34,8 +34,8 @@ def test_provider_token_immutability():
 
 
 def test_secret_store_immutability():
-    """Test that SecretStore is immutable"""
-    store = SecretStore(
+    """Test that UserSecrets is immutable"""
+    store = UserSecrets(
         provider_tokens={ProviderType.GITHUB: ProviderToken(token=SecretStr('test'))}
     )
 
@@ -69,7 +69,7 @@ def test_secret_store_immutability():
 def test_settings_immutability():
     """Test that Settings secrets_store is immutable"""
     settings = Settings(
-        secrets_store=SecretStore(
+        secrets_store=UserSecrets(
             provider_tokens={
                 ProviderType.GITHUB: ProviderToken(token=SecretStr('test'))
             }
@@ -78,7 +78,7 @@ def test_settings_immutability():
 
     # Test direct modification of secrets_store
     with pytest.raises(ValidationError):
-        settings.secrets_store = SecretStore()
+        settings.secrets_store = UserSecrets()
 
     # Test nested modification attempts
     with pytest.raises((TypeError, AttributeError)):
@@ -87,7 +87,7 @@ def test_settings_immutability():
         )
 
     # Test model_copy creates new instance
-    new_store = SecretStore(
+    new_store = UserSecrets(
         provider_tokens={
             ProviderType.GITHUB: ProviderToken(token=SecretStr('new_token'))
         }
@@ -114,39 +114,8 @@ def test_settings_immutability():
         ].token = SecretStr('')
 
 
-def test_post_settings_conversion():
-    """Test that POSTSettingsModel correctly converts to Settings"""
-    # Create POST model with token data
-    post_data = POSTSettingsModel(
-        provider_tokens={'github': 'test_token', 'gitlab': 'gitlab_token'}
-    )
-
-    # Convert to settings using convert_to_settings function
-    settings = convert_to_settings(post_data)
-
-    # Verify tokens were converted correctly
-    assert (
-        settings.secrets_store.provider_tokens[
-            ProviderType.GITHUB
-        ].token.get_secret_value()
-        == 'test_token'
-    )
-    assert (
-        settings.secrets_store.provider_tokens[
-            ProviderType.GITLAB
-        ].token.get_secret_value()
-        == 'gitlab_token'
-    )
-    assert settings.secrets_store.provider_tokens[ProviderType.GITLAB].user_id is None
-
-    # Verify immutability of converted settings
-    with pytest.raises(ValidationError):
-        settings.secrets_store = SecretStore()
-
-
 def test_provider_handler_immutability():
     """Test that ProviderHandler maintains token immutability"""
-
     # Create initial tokens
     tokens = MappingProxyType(
         {ProviderType.GITHUB: ProviderToken(token=SecretStr('test'))}
@@ -171,10 +140,10 @@ def test_provider_handler_immutability():
 
 
 def test_token_conversion():
-    """Test token conversion in SecretStore.create"""
+    """Test token conversion in UserSecrets.create"""
     # Test with string token
     store1 = Settings(
-        secrets_store=SecretStore(
+        secrets_store=UserSecrets(
             provider_tokens={
                 ProviderType.GITHUB: ProviderToken(token=SecretStr('test_token'))
             }
@@ -190,7 +159,7 @@ def test_token_conversion():
     assert store1.secrets_store.provider_tokens[ProviderType.GITHUB].user_id is None
 
     # Test with dict token
-    store2 = SecretStore(
+    store2 = UserSecrets(
         provider_tokens={'github': {'token': 'test_token', 'user_id': 'user1'}}
     )
     assert (
@@ -201,14 +170,14 @@ def test_token_conversion():
 
     # Test with ProviderToken
     token = ProviderToken(token=SecretStr('test_token'), user_id='user2')
-    store3 = SecretStore(provider_tokens={ProviderType.GITHUB: token})
+    store3 = UserSecrets(provider_tokens={ProviderType.GITHUB: token})
     assert (
         store3.provider_tokens[ProviderType.GITHUB].token.get_secret_value()
         == 'test_token'
     )
     assert store3.provider_tokens[ProviderType.GITHUB].user_id == 'user2'
 
-    store4 = SecretStore(
+    store4 = UserSecrets(
         provider_tokens={
             ProviderType.GITHUB: 123  # Invalid type
         }
@@ -217,13 +186,155 @@ def test_token_conversion():
     assert ProviderType.GITHUB not in store4.provider_tokens
 
     # Test with empty/None token
-    store5 = SecretStore(provider_tokens={ProviderType.GITHUB: None})
+    store5 = UserSecrets(provider_tokens={ProviderType.GITHUB: None})
     assert ProviderType.GITHUB not in store5.provider_tokens
 
-    store6 = SecretStore(
+    store6 = UserSecrets(
         provider_tokens={
             'invalid_provider': 'test_token'  # Invalid provider type
         }
     )
 
     assert len(store6.provider_tokens.keys()) == 0
+
+
+def test_provider_handler_type_enforcement():
+    with pytest.raises((TypeError)):
+        ProviderHandler(provider_tokens={'a': 'b'})
+
+
+def test_expose_env_vars():
+    """Test that expose_env_vars correctly exposes secrets as strings"""
+    tokens = MappingProxyType(
+        {
+            ProviderType.GITHUB: ProviderToken(token=SecretStr('test_token')),
+            ProviderType.GITLAB: ProviderToken(token=SecretStr('gitlab_token')),
+        }
+    )
+    handler = ProviderHandler(provider_tokens=tokens)
+
+    # Test with specific provider tokens
+    env_secrets = {
+        ProviderType.GITHUB: SecretStr('gh_token'),
+        ProviderType.GITLAB: SecretStr('gl_token'),
+    }
+    exposed = handler.expose_env_vars(env_secrets)
+
+    assert exposed['github_token'] == 'gh_token'
+    assert exposed['gitlab_token'] == 'gl_token'
+
+
+@pytest.mark.asyncio
+async def test_get_env_vars():
+    """Test get_env_vars with different configurations"""
+    tokens = MappingProxyType(
+        {
+            ProviderType.GITHUB: ProviderToken(token=SecretStr('test_token')),
+            ProviderType.GITLAB: ProviderToken(token=SecretStr('gitlab_token')),
+        }
+    )
+    handler = ProviderHandler(provider_tokens=tokens)
+
+    # Test getting all tokens unexposed
+    env_vars = await handler.get_env_vars(expose_secrets=False)
+    assert isinstance(env_vars, dict)
+    assert isinstance(env_vars[ProviderType.GITHUB], SecretStr)
+    assert env_vars[ProviderType.GITHUB].get_secret_value() == 'test_token'
+    assert env_vars[ProviderType.GITLAB].get_secret_value() == 'gitlab_token'
+
+    # Test getting specific providers
+    env_vars = await handler.get_env_vars(
+        expose_secrets=False, providers=[ProviderType.GITHUB]
+    )
+    assert len(env_vars) == 1
+    assert ProviderType.GITHUB in env_vars
+    assert ProviderType.GITLAB not in env_vars
+
+    # Test exposed secrets
+    exposed_vars = await handler.get_env_vars(expose_secrets=True)
+    assert isinstance(exposed_vars, dict)
+    assert exposed_vars['github_token'] == 'test_token'
+    assert exposed_vars['gitlab_token'] == 'gitlab_token'
+
+    # Test empty tokens
+    empty_handler = ProviderHandler(provider_tokens=MappingProxyType({}))
+    empty_vars = await empty_handler.get_env_vars()
+    assert empty_vars == {}
+
+
+@pytest.fixture
+def event_stream():
+    """Fixture for event stream testing"""
+
+    class TestEventStream:
+        def __init__(self):
+            self.secrets = {}
+
+        def set_secrets(self, secrets):
+            self.secrets = secrets
+
+    return TestEventStream()
+
+
+@pytest.mark.asyncio
+async def test_set_event_stream_secrets(event_stream):
+    """Test setting secrets in event stream"""
+    tokens = MappingProxyType(
+        {
+            ProviderType.GITHUB: ProviderToken(token=SecretStr('test_token')),
+            ProviderType.GITLAB: ProviderToken(token=SecretStr('gitlab_token')),
+        }
+    )
+    handler = ProviderHandler(provider_tokens=tokens)
+
+    # Test with provided env_vars
+    env_vars = {
+        ProviderType.GITHUB: SecretStr('new_token'),
+        ProviderType.GITLAB: SecretStr('new_gitlab_token'),
+    }
+    await handler.set_event_stream_secrets(event_stream, env_vars)
+    assert event_stream.secrets == {
+        'github_token': 'new_token',
+        'gitlab_token': 'new_gitlab_token',
+    }
+
+    # Test without env_vars (using existing tokens)
+    await handler.set_event_stream_secrets(event_stream)
+    assert event_stream.secrets == {
+        'github_token': 'test_token',
+        'gitlab_token': 'gitlab_token',
+    }
+
+
+def test_check_cmd_action_for_provider_token_ref():
+    """Test detection of provider tokens in command actions"""
+    # Test command with GitHub token
+    cmd = CmdRunAction(command='echo $GITHUB_TOKEN')
+    providers = ProviderHandler.check_cmd_action_for_provider_token_ref(cmd)
+    assert ProviderType.GITHUB in providers
+    assert len(providers) == 1
+
+    # Test command with multiple tokens
+    cmd = CmdRunAction(command='echo $GITHUB_TOKEN && echo $GITLAB_TOKEN')
+    providers = ProviderHandler.check_cmd_action_for_provider_token_ref(cmd)
+    assert ProviderType.GITHUB in providers
+    assert ProviderType.GITLAB in providers
+    assert len(providers) == 2
+
+    # Test command without tokens
+    cmd = CmdRunAction(command='echo "Hello"')
+    providers = ProviderHandler.check_cmd_action_for_provider_token_ref(cmd)
+    assert len(providers) == 0
+
+    # Test non-command action
+    from openhands.events.action import MessageAction
+
+    msg = MessageAction(content='test')
+    providers = ProviderHandler.check_cmd_action_for_provider_token_ref(msg)
+    assert len(providers) == 0
+
+
+def test_get_provider_env_key():
+    """Test provider environment key generation"""
+    assert ProviderHandler.get_provider_env_key(ProviderType.GITHUB) == 'github_token'
+    assert ProviderHandler.get_provider_env_key(ProviderType.GITLAB) == 'gitlab_token'

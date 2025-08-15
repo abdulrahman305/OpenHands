@@ -1,19 +1,23 @@
 import { useQuery } from "@tanstack/react-query";
 import { useConfig } from "./use-config";
+import { useIsAuthed } from "./use-is-authed";
 import OpenHands from "#/api/open-hands";
-import { useAuth } from "#/context/auth-context";
+import { useUserProviders } from "../use-user-providers";
+import { Provider } from "#/types/settings";
+import { shouldUseInstallationRepos } from "#/utils/utils";
 
-export const useAppInstallations = () => {
+export const useAppInstallations = (selectedProvider: Provider | null) => {
   const { data: config } = useConfig();
-  const { githubTokenIsSet } = useAuth();
+  const { data: userIsAuthenticated } = useIsAuthed();
+  const { providers } = useUserProviders();
 
   return useQuery({
-    queryKey: ["installations", githubTokenIsSet, config?.GITHUB_CLIENT_ID],
-    queryFn: OpenHands.getGitHubUserInstallationIds,
+    queryKey: ["installations", providers || [], selectedProvider],
+    queryFn: () => OpenHands.getUserInstallationIds(selectedProvider!),
     enabled:
-      githubTokenIsSet &&
-      !!config?.GITHUB_CLIENT_ID &&
-      config?.APP_MODE === "saas",
+      userIsAuthenticated &&
+      !!selectedProvider &&
+      shouldUseInstallationRepos(selectedProvider, config?.APP_MODE),
     staleTime: 1000 * 60 * 5, // 5 minutes
     gcTime: 1000 * 60 * 15, // 15 minutes
   });

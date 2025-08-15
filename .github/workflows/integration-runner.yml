@@ -18,7 +18,7 @@ env:
 jobs:
   run-integration-tests:
     if: github.event.label.name == 'integration-test' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     permissions:
       contents: "read"
       id-token: "write"
@@ -35,13 +35,13 @@ jobs:
         run: pipx install poetry
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: useblacksmith/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: "poetry"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: useblacksmith/setup-node@v5
         with:
           node-version: '22.x'
 
@@ -54,7 +54,7 @@ jobs:
             Hi! I started running the integration tests on your PR. You will receive a comment with the results shortly.
 
       - name: Install Python dependencies using Poetry
-        run: poetry install --without evaluation
+        run: poetry install --with dev,test,runtime,evaluation
 
       - name: Configure config.toml for testing with Haiku
         env:
@@ -179,8 +179,8 @@ jobs:
         id: create_comment
         uses: KeisukeYamashita/create-comment@v1
         with:
-          # if triggered by PR, use PR number, otherwise use 5318 as fallback issue number for manual triggers
-          number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || 5318 }}
+          # if triggered by PR, use PR number, otherwise use 9745 as fallback issue number for manual triggers
+          number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || 9745 }}
           unique: false
           comment: |
               Trigger by: ${{ github.event_name == 'pull_request' && format('Pull Request (integration-test label on PR #{0})', github.event.pull_request.number) || (github.event_name == 'workflow_dispatch' && format('Manual Trigger: {0}', github.event.inputs.reason)) || 'Nightly Scheduled Run' }}

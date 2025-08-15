@@ -19,13 +19,14 @@ class Test(BaseIntegrationTest):
         obs = runtime.run_action(action)
         assert_and_raise(obs.exit_code == 0, f'Failed to run command: {obs.content}')
 
-        # create README.md
+        # create file
         action = CmdRunAction(command='echo \'print("hello world")\' > hello.py')
         obs = runtime.run_action(action)
         assert_and_raise(obs.exit_code == 0, f'Failed to run command: {obs.content}')
 
-        # git add README.md
-        action = CmdRunAction(command='git add hello.py')
+        # git add
+        cmd_str = 'git add hello.py'
+        action = CmdRunAction(command=cmd_str)
         obs = runtime.run_action(action)
         assert_and_raise(obs.exit_code == 0, f'Failed to run command: {obs.content}')
 

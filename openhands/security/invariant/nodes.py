@@ -11,14 +11,14 @@ class LLM:
 
 
 class Event(BaseModel):
-    metadata: dict | None = Field(
+    metadata: dict[str, Any] | None = Field(
         default_factory=lambda: dict(), description='Metadata associated with the event'
     )
 
 
 class Function(BaseModel):
     name: str
-    arguments: dict
+    arguments: dict[str, Any]
 
 
 class ToolCall(Event):
@@ -32,7 +32,7 @@ class Message(Event):
     content: str | None
     tool_calls: list[ToolCall] | None = None
 
-    def __rich_repr__(
+    def __rich_repr__(  # type: ignore[override]
         self,
     ) -> Iterable[Any | tuple[Any] | tuple[str, Any] | tuple[str, Any, Any]]:
         # Print on separate line

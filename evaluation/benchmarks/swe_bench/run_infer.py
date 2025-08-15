@@ -3,21 +3,32 @@ import copy
 import json
 import os
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 import toml
 from datasets import load_dataset
+from jinja2 import Environment, FileSystemLoader
 
 import openhands.agenthub
+from evaluation.benchmarks.swe_bench.binary_patch_utils import (
+    remove_binary_diffs,
+    remove_binary_files_from_git,
+)
 from evaluation.benchmarks.swe_bench.resource.mapping import (
     get_instance_resource_factor,
+)
+from evaluation.benchmarks.swe_bench.resource.swt_bench_constants import (
+    MAP_REPO_TO_INSTALL,
+    MAP_REPO_TO_TEST_FRAMEWORK_VERBOSE,
+    MAP_VERSION_TO_INSTALL,
 )
 from evaluation.utils.shared import (
     EvalException,
     EvalMetadata,
     EvalOutput,
     assert_and_raise,
+    check_maximum_retries_exceeded,
     codeact_user_response,
     get_default_sandbox_config_for_eval,
     get_metrics,
@@ -31,15 +42,21 @@ from evaluation.utils.shared import (
 from openhands.controller.state.state import State
 from openhands.core.config import (
     AgentConfig,
-    AppConfig,
+    OpenHandsConfig,
+    get_evaluation_parser,
     get_llm_config_arg,
-    get_parser,
 )
+from openhands.core.config.condenser_config import NoOpCondenserConfig
+from openhands.core.config.utils import get_condenser_config_arg
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime, run_controller
 from openhands.critic import AgentFinishedCritic
-from openhands.events.action import CmdRunAction, MessageAction
-from openhands.events.observation import CmdOutputObservation, ErrorObservation
+from openhands.events.action import CmdRunAction, FileReadAction, MessageAction
+from openhands.events.observation import (
+    CmdOutputObservation,
+    ErrorObservation,
+    FileReadObservation,
+)
 from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
 from openhands.utils.async_utils import call_async_from_sync
@@ -47,6 +64,30 @@ from openhands.utils.shutdown_listener import sleep_if_should_continue
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
+ENABLE_LLM_EDITOR = os.environ.get('ENABLE_LLM_EDITOR', 'false').lower() == 'true'
+BenchMode = Literal['swe', 'swt', 'swt-ci']
+
+# Global variable to track dataset type
+DATASET_TYPE = 'SWE-bench'
+
+
+def set_dataset_type(dataset_name: str) -> str:
+    """Set dataset type based on dataset name."""
+    global DATASET_TYPE
+    name_lower = dataset_name.lower()
+
+    if 'swe-gym' in name_lower:
+        DATASET_TYPE = 'SWE-Gym'
+    elif 'swe-bench-live' in name_lower:
+        DATASET_TYPE = 'SWE-bench-Live'
+    elif 'swe-rebench' in name_lower:
+        DATASET_TYPE = 'SWE-rebench'
+    elif 'multimodal' in name_lower:
+        DATASET_TYPE = 'Multimodal'
+    else:
+        DATASET_TYPE = 'SWE-bench'
+
+    logger.info(f'Dataset type set to: {DATASET_TYPE}')
 
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
@@ -55,71 +96,69 @@ AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
 
 
 def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
-    return f'{instance.repo}__{instance.version}'.replace('/', '__')
+    if DATASET_TYPE == 'SWE-bench-Live':
+        return instance.instance_id
+    else:
+        return f'{instance.repo}__{instance.version}'.replace('/', '__')
 
 
-def get_instruction(instance: pd.Series, metadata: EvalMetadata):
+def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageAction:
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
-    instruction = f"""
-<uploaded_files>
-/workspace/{workspace_dir_name}
-</uploaded_files>
+    mode = metadata.details['mode']
+    llm_model = metadata.llm_config.model
 
-I've uploaded a python code repository in the directory {workspace_dir_name}. Consider the following issue description:
+    # Determine the template file based on mode and LLM
+    if mode.startswith('swt'):
+        template_name = 'swt.j2'
+    elif mode == 'swe':
+        if 'gpt-4.1' in llm_model:
+            template_name = 'swe_gpt4.j2'
+        else:
+            template_name = (
+                'swe_default.j2'  # Default for 'swe' mode (regular swe-bench)
+            )
+    else:
+        # Fallback or error handling if mode is unexpected
+        logger.error(f'Unexpected evaluation mode: {mode}. Falling back to default.')
+        template_name = 'swe_default.j2'
 
-<issue_description>
-{instance.problem_statement}
-</issue_description>
+    # Set up Jinja2 environment
+    # Assuming templates are in 'evaluation/benchmarks/swe_bench/prompts' relative to this script
+    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
+    env = Environment(loader=FileSystemLoader(prompts_dir))
+    template = env.get_template(template_name)
 
-Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?
-I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
-Also the development Python environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.
-Your task is to make the minimal changes to non-test files in the /workspace/{workspace_dir_name} directory to ensure the <issue_description> is satisfied.
+    # Prepare context for rendering
+    context = {
+        'instance': instance,
+        'workspace_dir_name': workspace_dir_name,
+        'metadata': metadata,  # Pass metadata if needed in templates
+    }
 
-Follow these steps to resolve the issue:
+    # Add specific context for swt-ci mode if needed
+    if mode == 'swt-ci':
+        context['test_instructions'] = (
+            f'The following command can be used to run the tests: `{list(MAP_REPO_TO_TEST_FRAMEWORK_VERBOSE[instance.repo].values())[0]}`. Make sure they fail in the expected way.\n'
+        )
+    else:
+        context['test_instructions'] = ''  # Ensure it's defined for other modes
 
-1. EXPLORATION: First, thoroughly explore the repository structure using tools like `find` and `grep`.
-   - Identify all files mentioned in the problem statement
-   - Locate where the issue occurs in the codebase
-   - Understand the surrounding context and dependencies
-   - Use `grep` to search for relevant functions, classes, or error messages
-
-2. ANALYSIS: Based on your exploration, think carefully about the problem and propose 2-5 possible approaches to fix the issue.
-   - Analyze the root cause of the problem
-   - Consider trade-offs between different solutions
-   - Select the most promising approach and explain your reasoning
-
-3. TEST CREATION: Before implementing any fix, create a script to reproduce and verify the issue.
-   - Look at existing test files in the repository to understand the test format/structure
-   - Create a minimal reproduction script that demonstrates the issue
-   - Run your script to confirm the error exists
-
-4. IMPLEMENTATION: Edit the source code to implement your chosen solution.
-   - Make minimal, focused changes to fix the issue
-
-5. VERIFICATION: Test your implementation thoroughly.
-   - Run your reproduction script to verify the fix works
-   - Add edge cases to your test script to ensure comprehensive coverage
-   - Run existing tests related to the modified code to ensure you haven't broken anything
-
-6. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit {instance["base_commit"]}.
-   - Ensure you've fully addressed all requirements
-   - Run any tests in the repository related to:
-     * The issue you are fixing
-     * The files you modified
-     * The functions you changed
-   - If any tests fail, revise your implementation until all tests pass
-
-Be thorough in your exploration, testing, and reasoning. It's fine if your thinking process is lengthy - quality and completeness are more important than brevity.
-"""
+    # Render the instruction
+    instruction = template.render(context)
 
     if RUN_WITH_BROWSING:
-        instruction += """
-<IMPORTANT!>
-You SHOULD NEVER attempt to browse the web.
-</IMPORTANT!>
-"""
-    return instruction
+        instruction += (
+            '<IMPORTANT!>\nYou SHOULD NEVER attempt to browse the web. </IMPORTANT!>\n'
+        )
+
+    if 'image_assets' in instance:
+        assets = json.loads(instance['image_assets'])
+        assert 'problem_statement' in assets, (
+            'problem_statement is required in image_assets'
+        )
+        image_urls = assets['problem_statement']
+        return MessageAction(content=instruction, image_urls=image_urls)
+    return MessageAction(content=instruction)
 
 
 # TODO: migrate all swe-bench docker to ghcr.io/openhands
@@ -129,14 +168,24 @@ DEFAULT_DOCKER_IMAGE_PREFIX = os.environ.get(
 logger.info(f'Default docker image prefix: {DEFAULT_DOCKER_IMAGE_PREFIX}')
 
 
-def get_instance_docker_image(instance_id: str, official_image: bool = False) -> str:
-    if official_image:
+def get_instance_docker_image(
+    instance_id: str,
+    swebench_official_image: bool = False,
+) -> str:
+    if swebench_official_image:
         # Official SWE-Bench image
         # swebench/sweb.eval.x86_64.django_1776_django-11333:v1
-        docker_image_prefix = 'docker.io/swebench/'
+        # SWE-bench-Live uses the same naming convention as SWE-Bench
+        if DATASET_TYPE == 'SWE-bench-Live':
+            docker_image_prefix = 'docker.io/starryzhang/'
+        elif DATASET_TYPE == 'SWE-bench':
+            docker_image_prefix = 'docker.io/swebench/'
+        elif DATASET_TYPE == 'SWE-rebench':
+            docker_image_prefix = 'docker.io/swerebench/'
         repo, name = instance_id.split('__')
-        image_name = f'sweb.eval.x86_64.{repo}_1776_{name}:latest'
-        logger.warning(f'Using official SWE-Bench image: {image_name}')
+        image_name = f'{docker_image_prefix.rstrip("/")}/sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
+        logger.debug(f'Using official SWE-Bench image: {image_name}')
+        return image_name
     else:
         # OpenHands version of the image
         docker_image_prefix = DEFAULT_DOCKER_IMAGE_PREFIX
@@ -144,20 +193,19 @@ def get_instance_docker_image(instance_id: str, official_image: bool = False) ->
         image_name = image_name.replace(
             '__', '_s_'
         )  # to comply with docker image naming convention
-    return (docker_image_prefix.rstrip('/') + '/' + image_name).lower()
+        return (docker_image_prefix.rstrip('/') + '/' + image_name).lower()
 
 
 def get_config(
     instance: pd.Series,
     metadata: EvalMetadata,
-) -> AppConfig:
+) -> OpenHandsConfig:
     # We use a different instance image for the each instance of swe-bench eval
-    use_official_image = bool(
-        ('verified' in metadata.dataset.lower() or 'lite' in metadata.dataset.lower())
-        and 'swe-gym' not in metadata.dataset.lower()
-    )
+    use_swebench_official_image = DATASET_TYPE != 'SWE-Gym'
+
     base_container_image = get_instance_docker_image(
-        instance['instance_id'], use_official_image
+        instance['instance_id'],
+        swebench_official_image=use_swebench_official_image,
     )
     logger.info(
         f'Using instance container image: {base_container_image}. '
@@ -176,25 +224,31 @@ def get_config(
         instance_id=instance['instance_id'],
     )
 
-    config = AppConfig(
+    config = OpenHandsConfig(
         default_agent=metadata.agent_class,
         run_as_openhands=False,
         max_iterations=metadata.max_iterations,
+        enable_browser=RUN_WITH_BROWSING,
         runtime=os.environ.get('RUNTIME', 'docker'),
         sandbox=sandbox_config,
         # do not mount workspace
         workspace_base=None,
         workspace_mount_path=None,
     )
+
     config.set_llm_config(
         update_llm_config_for_completions_logging(
             metadata.llm_config, metadata.eval_output_dir, instance['instance_id']
         )
     )
+    # get 'draft_editor' config if exists
+    config.set_llm_config(get_llm_config_arg('draft_editor'), 'draft_editor')
+
     agent_config = AgentConfig(
-        codeact_enable_jupyter=False,
-        codeact_enable_browsing=RUN_WITH_BROWSING,
-        codeact_enable_llm_editor=False,
+        enable_jupyter=False,
+        enable_browsing=RUN_WITH_BROWSING,
+        enable_llm_editor=ENABLE_LLM_EDITOR,
+        enable_mcp=False,
         condenser=metadata.condenser_config,
         enable_prompt_extensions=False,
     )
@@ -205,6 +259,7 @@ def get_config(
 def initialize_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required
+    metadata: EvalMetadata,
 ):
     """Initialize the runtime for the agent.
 
@@ -216,16 +271,17 @@ def initialize_runtime(
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
     obs: CmdOutputObservation
 
-    # Set instance id
+    # Set instance id and git configuration
     action = CmdRunAction(
-        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc"""
+        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc && git config --global core.pager "" && git config --global diff.binary false"""
     )
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(
-        obs.exit_code == 0, f'Failed to export SWE_INSTANCE_ID: {str(obs)}'
+        obs.exit_code == 0,
+        f'Failed to export SWE_INSTANCE_ID and configure git: {str(obs)}',
     )
 
     action = CmdRunAction(command="""export USER=$(whoami); echo USER=${USER} """)
@@ -264,8 +320,14 @@ def initialize_runtime(
         runtime.copy_to(temp_file_path, '/swe_util/eval_data/instances/')
 
         # inject the instance swe entry
+        if DATASET_TYPE == 'SWE-bench-Live':
+            entry_script_path = 'instance_swe_entry_live.sh'
+        elif DATASET_TYPE == 'SWE-rebench':
+            entry_script_path = 'instance_swe_entry_rebench.sh'
+        else:
+            entry_script_path = 'instance_swe_entry.sh'
         runtime.copy_to(
-            str(os.path.join(script_dir, 'scripts/setup/instance_swe_entry.sh')),
+            str(os.path.join(script_dir, f'scripts/setup/{entry_script_path}')),
             '/swe_util/',
         )
 
@@ -285,14 +347,14 @@ def initialize_runtime(
         logger.error(f'Failed to source ~/.bashrc: {str(obs)}')
     assert_and_raise(obs.exit_code == 0, f'Failed to source ~/.bashrc: {str(obs)}')
 
-    action = CmdRunAction(command='source /swe_util/instance_swe_entry.sh')
+    action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(
         obs.exit_code == 0,
-        f'Failed to source /swe_util/instance_swe_entry.sh: {str(obs)}',
+        f'Failed to source /swe_util/{entry_script_path}: {str(obs)}',
     )
 
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
@@ -321,15 +383,42 @@ def initialize_runtime(
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to remove git remotes: {str(obs)}')
 
-    action = CmdRunAction(command='which python')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        obs.exit_code == 0 and 'testbed' in obs.content,
-        f'Expected to find python interpreter from testbed, but got: {str(obs)}',
-    )
+    if metadata.details['mode'] == 'swt-ci':
+        # set up repo
+        setup_commands = []
+        if instance['repo'] in MAP_REPO_TO_INSTALL:
+            setup_commands.append(MAP_REPO_TO_INSTALL[instance['repo']])
+
+        # Run pre-install set up if provided
+        install = MAP_VERSION_TO_INSTALL.get(instance['repo'], {}).get(
+            instance['version'], []
+        )
+        if 'pre_install' in install:
+            for pre_install in install['pre_install']:
+                setup_commands.append(pre_install)
+
+        if 'install' in install:
+            setup_commands.append(install['install'])
+
+        for command in setup_commands:
+            action = CmdRunAction(command=command)
+            action.set_hard_timeout(600)
+            logger.info(action, extra={'msg_type': 'ACTION'})
+            obs = runtime.run_action(action)
+            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    if DATASET_TYPE != 'Multimodal' and DATASET_TYPE != 'SWE-bench-Live':
+        # Only for non-multimodal datasets, we need to activate the testbed environment for Python
+        # SWE-Bench multimodal datasets and SWE-bench-Live are not using the testbed environment
+        action = CmdRunAction(command='which python')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert_and_raise(
+            obs.exit_code == 0 and 'testbed' in obs.content,
+            f'Expected to find python interpreter from testbed, but got: {str(obs)}',
+        )
 
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
@@ -363,6 +452,21 @@ def complete_runtime(
         # We need to kill previous command
         logger.info('The previous command is still running, trying to kill it...')
         action = CmdRunAction(command='C-c')
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # Then run the command again
+        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    if obs.exit_code == -1:
+        # The previous command is still running
+        # We need to kill previous command
+        logger.info('The previous command is still running, trying to ctrl+z it...')
+        action = CmdRunAction(command='C-z')
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
@@ -424,11 +528,22 @@ def complete_runtime(
         f'Failed to git add -A: {str(obs)}',
     )
 
+    # Remove binary files from git staging
+    action = CmdRunAction(command=remove_binary_files_from_git())
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to remove binary files: {str(obs)}',
+    )
+
     n_retries = 0
     git_patch = None
     while n_retries < 5:
         action = CmdRunAction(
-            command=f'git diff --no-color --cached {instance["base_commit"]}'
+            command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
         )
         action.set_hard_timeout(max(300 + 100 * n_retries, 600))
         logger.info(action, extra={'msg_type': 'ACTION'})
@@ -437,8 +552,28 @@ def complete_runtime(
         n_retries += 1
         if isinstance(obs, CmdOutputObservation):
             if obs.exit_code == 0:
-                git_patch = obs.content.strip()
-                break
+                # Read the patch file
+                action = FileReadAction(path='patch.diff')
+                action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                logger.info(action, extra={'msg_type': 'ACTION'})
+                obs = runtime.run_action(action)
+                logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+                if isinstance(obs, FileReadObservation):
+                    git_patch = obs.content
+                    break
+                elif isinstance(obs, ErrorObservation):
+                    # Fall back to cat "patch.diff" to get the patch
+                    assert 'File could not be decoded as utf-8' in obs.content
+                    action = CmdRunAction(command='cat patch.diff')
+                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    logger.info(action, extra={'msg_type': 'ACTION'})
+                    obs = runtime.run_action(action)
+                    assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
+                    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+                    git_patch = obs.content
+                    break
+                else:
+                    assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
             else:
                 logger.info('Failed to get git diff, retrying...')
                 sleep_if_should_continue(10)
@@ -449,6 +584,9 @@ def complete_runtime(
             assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
 
     assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
+
+    # Remove binary diffs from the patch
+    git_patch = remove_binary_diffs(git_patch)
 
     logger.info('-' * 30)
     logger.info('END Runtime Completion Fn')
@@ -491,15 +629,15 @@ def process_instance(
     call_async_from_sync(runtime.connect)
 
     try:
-        initialize_runtime(runtime, instance)
+        initialize_runtime(runtime, instance, metadata)
 
-        instruction = get_instruction(instance, metadata)
+        message_action = get_instruction(instance, metadata)
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
         state: State | None = asyncio.run(
             run_controller(
                 config=config,
-                initial_user_action=MessageAction(content=instruction),
+                initial_user_action=message_action,
                 runtime=runtime,
                 fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
                     metadata.agent_class
@@ -513,7 +651,13 @@ def process_instance(
 
         # ======= THIS IS SWE-Bench specific =======
         # Get git patch
-        return_val = complete_runtime(runtime, instance)
+        if DATASET_TYPE == 'SWE-bench-Live':
+            from evaluation.benchmarks.swe_bench.live_utils import (
+                complete_runtime as complete_runtime_fn,
+            )
+        else:
+            complete_runtime_fn = complete_runtime
+        return_val = complete_runtime_fn(runtime, instance)
         git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
@@ -539,6 +683,11 @@ def process_instance(
     metrics = get_metrics(state)
 
     # Save the output
+    instruction = message_action.content
+    if message_action.image_urls:
+        instruction += (
+            '\n\n<image_urls>' + '\n'.join(message_action.image_urls) + '</image_urls>'
+        )
     output = EvalOutput(
         instance_id=instance.instance_id,
         instruction=instruction,
@@ -565,6 +714,20 @@ def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
                 subset = dataset[dataset[filter_column].isin(selected_ids)]
                 logger.info(f'Retained {subset.shape[0]} tasks after filtering')
                 return subset
+            if 'selected_repos' in data:
+                # repos for the swe-bench instances:
+                # ['astropy/astropy', 'django/django', 'matplotlib/matplotlib', 'mwaskom/seaborn', 'pallets/flask', 'psf/requests', 'pydata/xarray', 'pylint-dev/pylint', 'pytest-dev/pytest', 'scikit-learn/scikit-learn', 'sphinx-doc/sphinx', 'sympy/sympy']
+                selected_repos = data['selected_repos']
+                if isinstance(selected_repos, str):
+                    selected_repos = [selected_repos]
+                assert isinstance(selected_repos, list)
+                logger.info(
+                    f'Filtering {selected_repos} tasks from "selected_repos"...'
+                )
+                subset = dataset[dataset['repo'].isin(selected_repos)]
+                logger.info(f'Retained {subset.shape[0]} tasks after filtering')
+                return subset
+
     skip_ids = os.environ.get('SKIP_IDS', '').split(',')
     if len(skip_ids) > 0:
         logger.info(f'Filtering {len(skip_ids)} tasks from "SKIP_IDS"...')
@@ -573,7 +736,7 @@ def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
 
 
 if __name__ == '__main__':
-    parser = get_parser()
+    parser = get_evaluation_parser()
     parser.add_argument(
         '--dataset',
         type=str,
@@ -586,16 +749,28 @@ if __name__ == '__main__':
         default='test',
         help='split to evaluate on',
     )
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='swe',
+        choices=['swe', 'swt', 'swt-ci'],
+        help="mode to run the evaluation, either 'swe', 'swt', or 'swt-ci'",
+    )
+
     args, _ = parser.parse_known_args()
 
     # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
     # so we don't need to manage file uploading to OpenHands's repo
     dataset = load_dataset(args.dataset, split=args.split)
+
+    # Set the global dataset type based on dataset name
+    set_dataset_type(args.dataset)
+
     swe_bench_tests = filter_dataset(dataset.to_pandas(), 'instance_id')
     logger.info(
         f'Loaded dataset {args.dataset} with split {args.split}: {len(swe_bench_tests)} tasks'
     )
-    if 'SWE-Gym' in args.dataset:
+    if DATASET_TYPE == 'SWE-Gym':
         with open(
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
@@ -622,7 +797,22 @@ if __name__ == '__main__':
     if llm_config is None:
         raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
 
-    details = {}
+    # Get condenser config from environment variable
+    condenser_name = os.environ.get('EVAL_CONDENSER')
+    if condenser_name:
+        condenser_config = get_condenser_config_arg(condenser_name)
+        if condenser_config is None:
+            raise ValueError(
+                f'Could not find Condenser config: EVAL_CONDENSER={condenser_name}'
+            )
+    else:
+        # If no specific condenser config is provided via env var, default to NoOpCondenser
+        condenser_config = NoOpCondenserConfig()
+        logger.debug(
+            'No Condenser config provided via EVAL_CONDENSER, using NoOpCondenser.'
+        )
+
+    details = {'mode': args.mode}
     _agent_cls = openhands.agenthub.Agent.get_cls(args.agent_cls)
 
     dataset_descrption = (
@@ -636,6 +826,7 @@ if __name__ == '__main__':
         args.eval_note,
         args.eval_output_dir,
         details=details,
+        condenser_config=condenser_config,
     )
 
     output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
@@ -728,9 +919,19 @@ if __name__ == '__main__':
             with open(cur_output_file, 'r') as f:
                 for line in f:
                     instance = json.loads(line)
-                    history = [event_from_dict(event) for event in instance['history']]
-                    critic_result = critic.evaluate(history)
-                    if not critic_result.success:
+                    try:
+                        history = [
+                            event_from_dict(event) for event in instance['history']
+                        ]
+                        critic_result = critic.evaluate(
+                            history, instance['test_result'].get('git_patch', '')
+                        )
+                        if not critic_result.success:
+                            instances_failed.append(instance['instance_id'])
+                    except Exception as e:
+                        logger.error(
+                            f'Error loading history for instance {instance["instance_id"]}: {e}'
+                        )
                         instances_failed.append(instance['instance_id'])
             logger.info(
                 f'{len(instances_failed)} instances failed the current attempt {attempt}: {instances_failed}'
@@ -759,7 +960,11 @@ if __name__ == '__main__':
             with open(cur_output_file, 'r') as f:
                 for line in f:
                     instance = json.loads(line)
-                    if instance['instance_id'] not in added_instance_ids:
+                    # Also make sure git_patch is not empty - otherwise we fall back to previous attempt (empty patch is worse than anything else)
+                    if (
+                        instance['instance_id'] not in added_instance_ids
+                        and instance['test_result'].get('git_patch', '').strip()
+                    ):
                         fout.write(line)
                         added_instance_ids.add(instance['instance_id'])
             logger.info(
@@ -769,3 +974,5 @@ if __name__ == '__main__':
         logger.info(
             f'Done! Total {len(added_instance_ids)} instances added to {output_file}'
         )
+        # Check if any instances reached maximum retries
+        check_maximum_retries_exceeded(metadata.eval_output_dir)

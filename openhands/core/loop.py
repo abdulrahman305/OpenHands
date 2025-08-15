@@ -5,6 +5,7 @@ from openhands.core.logger import openhands_logger as logger
 from openhands.core.schema import AgentState
 from openhands.memory.memory import Memory
 from openhands.runtime.base import Runtime
+from openhands.runtime.runtime_status import RuntimeStatus
 
 
 async def run_agent_until_done(
@@ -12,14 +13,13 @@ async def run_agent_until_done(
     runtime: Runtime,
     memory: Memory,
     end_states: list[AgentState],
-):
-    """
-    run_agent_until_done takes a controller and a runtime, and will run
+) -> None:
+    """run_agent_until_done takes a controller and a runtime, and will run
     the agent until it reaches a terminal state.
     Note that runtime must be connected before being passed in here.
     """
 
-    def status_callback(msg_type, msg_id, msg):
+    def status_callback(msg_type: str, runtime_status: RuntimeStatus, msg: str) -> None:
         if msg_type == 'error':
             logger.error(msg)
             if controller:

@@ -1,6 +1,6 @@
 import os
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 class SandboxConfig(BaseModel):
@@ -37,7 +37,10 @@ class SandboxConfig(BaseModel):
             Must be one of [1, 2, 4, 8]. Will only be used if the runtime is remote.
         enable_gpu: Whether to enable GPU.
         docker_runtime_kwargs: Additional keyword arguments to pass to the Docker runtime when running containers.
-            This should be a JSON string that will be parsed into a dictionary.
+            This should be a Python dictionary literal string that will be parsed into a dictionary.
+        trusted_dirs: List of directories that can be trusted to run the OpenHands CLI.
+        vscode_port: The port to use for VSCode. If None, a random port will be chosen.
+            This is useful when deploying OpenHands in a remote machine where you need to expose a specific port.
     """
 
     remote_runtime_api_url: str | None = Field(default='http://localhost:8000')
@@ -46,7 +49,7 @@ class SandboxConfig(BaseModel):
     pause_closed_runtimes: bool = Field(default=True)
     rm_all_containers: bool = Field(default=False)
     api_key: str | None = Field(default=None)
-    base_container_image: str = Field(
+    base_container_image: str | None = Field(
         default='nikolaik/python-nodejs:python3.12-nodejs22'
     )
     runtime_container_image: str | None = Field(default=None)
@@ -70,18 +73,27 @@ class SandboxConfig(BaseModel):
     runtime_startup_env_vars: dict[str, str] = Field(default_factory=dict)
     browsergym_eval_env: str | None = Field(default=None)
     platform: str | None = Field(default=None)
-    close_delay: int = Field(default=15)
+    close_delay: int = Field(
+        default=3600,
+        description='The delay in seconds before closing the sandbox after the agent is done.',
+    )
     remote_runtime_resource_factor: int = Field(default=1)
     enable_gpu: bool = Field(default=False)
     docker_runtime_kwargs: dict | None = Field(default=None)
     selected_repo: str | None = Field(default=None)
+    trusted_dirs: list[str] = Field(default_factory=list)
+    vscode_port: int | None = Field(default=None)
+    volumes: str | None = Field(
+        default=None,
+        description="Volume mounts in the format 'host_path:container_path[:mode]', e.g. '/my/host/dir:/workspace:rw'. Multiple mounts can be specified using commas, e.g. '/path1:/workspace/path1,/path2:/workspace/path2:ro'",
+    )
 
-    model_config = {'extra': 'forbid'}
+    cuda_visible_devices: str | None = Field(default=None)
+    model_config = ConfigDict(extra='forbid')
 
     @classmethod
     def from_toml_section(cls, data: dict) -> dict[str, 'SandboxConfig']:
-        """
-        Create a mapping of SandboxConfig instances from a toml dictionary representing the [sandbox] section.
+        """Create a mapping of SandboxConfig instances from a toml dictionary representing the [sandbox] section.
 
         The configuration is built from all keys in data.
 
@@ -98,3 +110,9 @@ class SandboxConfig(BaseModel):
             raise ValueError(f'Invalid sandbox configuration: {e}')
 
         return sandbox_mapping
+
+    @model_validator(mode='after')
+    def set_default_base_image(self) -> 'SandboxConfig':
+        if self.base_container_image is None:
+            self.base_container_image = 'nikolaik/python-nodejs:python3.12-nodejs22'
+        return self

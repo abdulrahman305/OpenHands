@@ -1,22 +1,32 @@
 import asyncio
+import copy
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from litellm import ContextWindowExceededError
+from litellm import (
+    BadRequestError,
+    ContentPolicyViolationError,
+    ContextWindowExceededError,
+)
 
 from openhands.controller.agent import Agent
 from openhands.controller.agent_controller import AgentController
-from openhands.controller.state.state import State, TrafficControlState
-from openhands.core.config import AppConfig
+from openhands.controller.state.control_flags import (
+    BudgetControlFlag,
+)
+from openhands.controller.state.state import State
+from openhands.core.config import OpenHandsConfig
 from openhands.core.config.agent_config import AgentConfig
 from openhands.core.main import run_controller
 from openhands.core.schema import AgentState
 from openhands.events import Event, EventSource, EventStream, EventStreamSubscriber
 from openhands.events.action import ChangeAgentStateAction, CmdRunAction, MessageAction
-from openhands.events.action.agent import RecallAction
+from openhands.events.action.agent import CondensationAction, RecallAction
+from openhands.events.action.message import SystemMessageAction
 from openhands.events.event import RecallType
 from openhands.events.observation import (
+    AgentStateChangedObservation,
     ErrorObservation,
 )
 from openhands.events.observation.agent import RecallObservation
@@ -24,8 +34,17 @@ from openhands.events.observation.empty import NullObservation
 from openhands.events.serialization import event_to_dict
 from openhands.llm import LLM
 from openhands.llm.metrics import Metrics, TokenUsage
+from openhands.memory.condenser.condenser import Condensation
+from openhands.memory.condenser.impl.conversation_window_condenser import (
+    ConversationWindowCondenser,
+)
 from openhands.memory.memory import Memory
+from openhands.memory.view import View
 from openhands.runtime.base import Runtime
+from openhands.runtime.impl.action_execution.action_execution_client import (
+    ActionExecutionClient,
+)
+from openhands.runtime.runtime_status import RuntimeStatus
 from openhands.storage.memory import InMemoryFileStore
 
 
@@ -46,7 +65,20 @@ def mock_agent():
     agent = MagicMock(spec=Agent)
     agent.llm = MagicMock(spec=LLM)
     agent.llm.metrics = Metrics()
-    agent.llm.config = AppConfig().get_llm_config()
+    agent.llm.config = OpenHandsConfig().get_llm_config()
+
+    # Add config with enable_mcp attribute
+    agent.config = MagicMock(spec=AgentConfig)
+    agent.config.enable_mcp = True
+
+    # Add a proper system message mock
+    system_message = SystemMessageAction(
+        content='Test system message', tools=['test_tool']
+    )
+    system_message._source = EventSource.AGENT
+    system_message._id = -1  # Set invalid ID to avoid the ID check
+    agent.get_system_message.return_value = system_message
+
     return agent
 
 
@@ -68,8 +100,12 @@ def test_event_stream():
 
 @pytest.fixture
 def mock_runtime() -> Runtime:
+    from openhands.runtime.impl.action_execution.action_execution_client import (
+        ActionExecutionClient,
+    )
+
     runtime = MagicMock(
-        spec=Runtime,
+        spec=ActionExecutionClient,
         event_stream=test_event_stream,
     )
     return runtime
@@ -81,6 +117,8 @@ def mock_memory() -> Memory:
         spec=Memory,
         event_stream=test_event_stream,
     )
+    # Add the get_microagent_mcp_tools method to the mock
+    memory.get_microagent_mcp_tools.return_value = []
     return memory
 
 
@@ -100,7 +138,7 @@ async def test_set_agent_state(mock_agent, mock_event_stream):
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
@@ -118,7 +156,7 @@ async def test_on_event_message_action(mock_agent, mock_event_stream):
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
@@ -135,7 +173,7 @@ async def test_on_event_change_agent_state_action(mock_agent, mock_event_stream)
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
@@ -153,7 +191,7 @@ async def test_react_to_exception(mock_agent, mock_event_stream, mock_status_cal
         agent=mock_agent,
         event_stream=mock_event_stream,
         status_callback=mock_status_callback,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
@@ -165,22 +203,63 @@ async def test_react_to_exception(mock_agent, mock_event_stream, mock_status_cal
 
 
 @pytest.mark.asyncio
-async def test_run_controller_with_fatal_error(test_event_stream, mock_memory):
-    config = AppConfig()
+async def test_react_to_content_policy_violation(
+    mock_agent, mock_event_stream, mock_status_callback
+):
+    """Test that the controller properly handles content policy violations from the LLM."""
+    controller = AgentController(
+        agent=mock_agent,
+        event_stream=mock_event_stream,
+        status_callback=mock_status_callback,
+        iteration_delta=10,
+        sid='test',
+        confirmation_mode=False,
+        headless_mode=True,
+    )
 
-    agent = MagicMock(spec=Agent)
-    agent = MagicMock(spec=Agent)
+    controller.state.agent_state = AgentState.RUNNING
+
+    # Create and handle the content policy violation error
+    error = ContentPolicyViolationError(
+        message='Output blocked by content filtering policy',
+        model='gpt-4',
+        llm_provider='openai',
+    )
+    await controller._react_to_exception(error)
+
+    # Verify the status callback was called with correct parameters
+    mock_status_callback.assert_called_once_with(
+        'error',
+        RuntimeStatus.ERROR_LLM_CONTENT_POLICY_VIOLATION,
+        RuntimeStatus.ERROR_LLM_CONTENT_POLICY_VIOLATION.value,
+    )
+
+    # Verify the state was updated correctly
+    assert (
+        controller.state.last_error
+        == RuntimeStatus.ERROR_LLM_CONTENT_POLICY_VIOLATION.value
+    )
+    assert controller.state.agent_state == AgentState.ERROR
+
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_run_controller_with_fatal_error(
+    test_event_stream, mock_memory, mock_agent
+):
+    config = OpenHandsConfig()
 
     def agent_step_fn(state):
         print(f'agent_step_fn received state: {state}')
         return CmdRunAction(command='ls')
 
-    agent.step = agent_step_fn
-    agent.llm = MagicMock(spec=LLM)
-    agent.llm.metrics = Metrics()
-    agent.llm.config = config.get_llm_config()
+    mock_agent.step = agent_step_fn
+    mock_agent.llm = MagicMock(spec=LLM)
+    mock_agent.llm.metrics = Metrics()
+    mock_agent.llm.config = config.get_llm_config()
 
-    runtime = MagicMock(spec=Runtime)
+    runtime = MagicMock(spec=ActionExecutionClient)
 
     def on_event(event: Event):
         if isinstance(event, CmdRunAction):
@@ -190,6 +269,7 @@ async def test_run_controller_with_fatal_error(test_event_stream, mock_memory):
 
     test_event_stream.subscribe(EventStreamSubscriber.RUNTIME, on_event, str(uuid4()))
     runtime.event_stream = test_event_stream
+    runtime.config = copy.deepcopy(config)
 
     def on_event_memory(event: Event):
         if isinstance(event, RecallAction):
@@ -209,33 +289,43 @@ async def test_run_controller_with_fatal_error(test_event_stream, mock_memory):
         initial_user_action=MessageAction(content='Test message'),
         runtime=runtime,
         sid='test',
-        agent=agent,
+        agent=mock_agent,
         fake_user_response_fn=lambda _: 'repeat',
         memory=mock_memory,
     )
     print(f'state: {state}')
     events = list(test_event_stream.get_events())
     print(f'event_stream: {events}')
-    assert state.iteration == 3
+    error_observations = test_event_stream.get_matching_events(
+        reverse=True, limit=1, event_types=(AgentStateChangedObservation)
+    )
+    assert len(error_observations) == 1
+    error_observation = error_observations[0]
+    assert state.iteration_flag.current_value == 3
     assert state.agent_state == AgentState.ERROR
     assert state.last_error == 'AgentStuckInLoopError: Agent got stuck in a loop'
-    assert len(events) == 11
+    assert (
+        error_observation.reason == 'AgentStuckInLoopError: Agent got stuck in a loop'
+    )
+    assert len(events) == 12
 
 
 @pytest.mark.asyncio
-async def test_run_controller_stop_with_stuck(test_event_stream, mock_memory):
-    config = AppConfig()
-    agent = MagicMock(spec=Agent)
+async def test_run_controller_stop_with_stuck(
+    test_event_stream, mock_memory, mock_agent
+):
+    config = OpenHandsConfig()
 
     def agent_step_fn(state):
         print(f'agent_step_fn received state: {state}')
         return CmdRunAction(command='ls')
 
-    agent.step = agent_step_fn
-    agent.llm = MagicMock(spec=LLM)
-    agent.llm.metrics = Metrics()
-    agent.llm.config = config.get_llm_config()
-    runtime = MagicMock(spec=Runtime)
+    mock_agent.step = agent_step_fn
+    mock_agent.llm = MagicMock(spec=LLM)
+    mock_agent.llm.metrics = Metrics()
+    mock_agent.llm.config = config.get_llm_config()
+
+    runtime = MagicMock(spec=ActionExecutionClient)
 
     def on_event(event: Event):
         if isinstance(event, CmdRunAction):
@@ -247,6 +337,7 @@ async def test_run_controller_stop_with_stuck(test_event_stream, mock_memory):
 
     test_event_stream.subscribe(EventStreamSubscriber.RUNTIME, on_event, str(uuid4()))
     runtime.event_stream = test_event_stream
+    runtime.config = copy.deepcopy(config)
 
     def on_event_memory(event: Event):
         if isinstance(event, RecallAction):
@@ -266,7 +357,7 @@ async def test_run_controller_stop_with_stuck(test_event_stream, mock_memory):
         initial_user_action=MessageAction(content='Test message'),
         runtime=runtime,
         sid='test',
-        agent=agent,
+        agent=mock_agent,
         fake_user_response_fn=lambda _: 'repeat',
         memory=mock_memory,
     )
@@ -275,10 +366,11 @@ async def test_run_controller_stop_with_stuck(test_event_stream, mock_memory):
     for i, event in enumerate(events):
         print(f'event {i}: {event_to_dict(event)}')
 
-    assert state.iteration == 3
-    assert len(events) == 11
+    assert state.iteration_flag.current_value == 3
+    assert len(events) == 12
     # check the eventstream have 4 pairs of repeated actions and observations
-    repeating_actions_and_observations = events[4:12]
+    # With the refactored system message handling, we need to adjust the range
+    repeating_actions_and_observations = events[5:13]
     for action, observation in zip(
         repeating_actions_and_observations[0::2],
         repeating_actions_and_observations[1::2],
@@ -301,24 +393,19 @@ async def test_run_controller_stop_with_stuck(test_event_stream, mock_memory):
 @pytest.mark.asyncio
 async def test_max_iterations_extension(mock_agent, mock_event_stream):
     # Test with headless_mode=False - should extend max_iterations
-    initial_state = State(max_iterations=10)
-
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=False,
-        initial_state=initial_state,
     )
     controller.state.agent_state = AgentState.RUNNING
-    controller.state.iteration = 10
-    assert controller.state.traffic_control_state == TrafficControlState.NORMAL
+    controller.state.iteration_flag.current_value = 10
 
     # Trigger throttling by calling _step() when we hit max_iterations
     await controller._step()
-    assert controller.state.traffic_control_state == TrafficControlState.THROTTLING
     assert controller.state.agent_state == AgentState.ERROR
 
     # Simulate a new user message
@@ -328,28 +415,24 @@ async def test_max_iterations_extension(mock_agent, mock_event_stream):
 
     # Max iterations should be extended to current iteration + initial max_iterations
     assert (
-        controller.state.max_iterations == 20
+        controller.state.iteration_flag.max_value == 20
     )  # Current iteration (10 initial because _step() should not have been executed) + initial max_iterations (10)
-    assert controller.state.traffic_control_state == TrafficControlState.NORMAL
     assert controller.state.agent_state == AgentState.RUNNING
 
     # Close the controller to clean up
     await controller.close()
 
     # Test with headless_mode=True - should NOT extend max_iterations
-    initial_state = State(max_iterations=10)
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
-        initial_state=initial_state,
     )
     controller.state.agent_state = AgentState.RUNNING
-    controller.state.iteration = 10
-    assert controller.state.traffic_control_state == TrafficControlState.NORMAL
+    controller.state.iteration_flag.current_value = 10
 
     # Simulate a new user message
     message_action = MessageAction(content='Test message')
@@ -357,54 +440,132 @@ async def test_max_iterations_extension(mock_agent, mock_event_stream):
     await send_event_to_controller(controller, message_action)
 
     # Max iterations should NOT be extended in headless mode
-    assert controller.state.max_iterations == 10  # Original value unchanged
+    assert controller.state.iteration_flag.max_value == 10  # Original value unchanged
 
     # Trigger throttling by calling _step() when we hit max_iterations
     await controller._step()
 
-    assert controller.state.traffic_control_state == TrafficControlState.THROTTLING
     assert controller.state.agent_state == AgentState.ERROR
     await controller.close()
 
 
 @pytest.mark.asyncio
 async def test_step_max_budget(mock_agent, mock_event_stream):
+    # Metrics are always synced with budget flag before
+    metrics = Metrics()
+    metrics.accumulated_cost = 10.1
+    budget_flag = BudgetControlFlag(
+        limit_increase_amount=10, current_value=10.1, max_value=10
+    )
+
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
-        max_budget_per_task=10,
+        iteration_delta=10,
+        budget_per_task_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=False,
+        initial_state=State(budget_flag=budget_flag, metrics=metrics),
     )
     controller.state.agent_state = AgentState.RUNNING
-    controller.state.metrics.accumulated_cost = 10.1
-    assert controller.state.traffic_control_state == TrafficControlState.NORMAL
     await controller._step()
-    assert controller.state.traffic_control_state == TrafficControlState.THROTTLING
     assert controller.state.agent_state == AgentState.ERROR
     await controller.close()
 
 
 @pytest.mark.asyncio
 async def test_step_max_budget_headless(mock_agent, mock_event_stream):
+    # Metrics are always synced with budget flag before
+    metrics = Metrics()
+    metrics.accumulated_cost = 10.1
+    budget_flag = BudgetControlFlag(
+        limit_increase_amount=10, current_value=10.1, max_value=10
+    )
+
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
-        max_budget_per_task=10,
+        iteration_delta=10,
+        budget_per_task_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
+        initial_state=State(budget_flag=budget_flag, metrics=metrics),
     )
     controller.state.agent_state = AgentState.RUNNING
-    controller.state.metrics.accumulated_cost = 10.1
-    assert controller.state.traffic_control_state == TrafficControlState.NORMAL
     await controller._step()
-    assert controller.state.traffic_control_state == TrafficControlState.THROTTLING
-    # In headless mode, throttling results in an error
     assert controller.state.agent_state == AgentState.ERROR
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_budget_reset_on_continue(mock_agent, mock_event_stream):
+    """Test that when a user continues after hitting the budget limit:
+    1. Error is thrown when budget cap is exceeded
+    2. LLM budget does not reset when user continues
+    3. Budget is extended by adding the initial budget cap to the current accumulated cost
+    """
+    # Create a real Metrics instance shared between controller state and llm
+    metrics = Metrics()
+    metrics.accumulated_cost = 6.0
+
+    initial_budget = 5.0
+
+    initial_state = State(
+        metrics=metrics,
+        budget_flag=BudgetControlFlag(
+            limit_increase_amount=initial_budget,
+            current_value=6.0,
+            max_value=initial_budget,
+        ),
+    )
+
+    # Create controller with budget cap
+    controller = AgentController(
+        agent=mock_agent,
+        event_stream=mock_event_stream,
+        iteration_delta=10,
+        budget_per_task_delta=initial_budget,
+        sid='test',
+        confirmation_mode=False,
+        headless_mode=False,
+        initial_state=initial_state,
+    )
+
+    # Set up initial state
+    controller.state.agent_state = AgentState.RUNNING
+
+    # Set up metrics to simulate having spent more than the budget
+    assert controller.state.budget_flag.current_value == 6.0
+    assert controller.agent.llm.metrics.accumulated_cost == 6.0
+
+    # Trigger budget limit
+    await controller._step()
+
+    # Verify budget limit was hit and error was thrown
+    assert controller.state.agent_state == AgentState.ERROR
+    assert 'budget' in controller.state.last_error.lower()
+
+    # Now set the agent state to RUNNING (simulating user clicking "continue")
+    await controller.set_agent_state_to(AgentState.RUNNING)
+
+    # Now simulate user sending a message
+    message_action = MessageAction(content='Please continue')
+    message_action._source = EventSource.USER
+    await controller._on_event(message_action)
+
+    # Verify budget cap was extended by adding initial budget to current accumulated cost
+    # accumulated cost (6.0) + initial budget (5.0) = 11.0
+    assert controller.state.budget_flag.max_value == 11.0
+
+    # Verify LLM metrics were NOT reset - they should still be 6.0
+    assert controller.agent.llm.metrics.accumulated_cost == 6.0
+
+    # The controller state metrics are same as llm metrics
+    assert controller.state.metrics.accumulated_cost == 6.0
+
+    # Verify traffic control state was reset
     await controller.close()
 
 
@@ -414,11 +575,14 @@ async def test_reset_with_pending_action_no_observation(mock_agent, mock_event_s
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
     )
+
+    mock_event_stream.add_event.assert_called_once()  # add SystemMessageAction
+    mock_event_stream.add_event.reset_mock()
 
     # Create a pending action with tool call metadata
     pending_action = CmdRunAction(command='test')
@@ -436,7 +600,57 @@ async def test_reset_with_pending_action_no_observation(mock_agent, mock_event_s
     args, kwargs = mock_event_stream.add_event.call_args
     error_obs, source = args
     assert isinstance(error_obs, ErrorObservation)
-    assert error_obs.content == 'The action has not been executed.'
+    assert (
+        error_obs.content
+        == 'The action has not been executed due to a runtime error. The runtime system may have crashed and restarted due to resource constraints. Any previously established system state, dependencies, or environment variables may have been lost.'
+    )
+    assert error_obs.tool_call_metadata == pending_action.tool_call_metadata
+    assert error_obs._cause == pending_action.id
+    assert source == EventSource.AGENT
+
+    # Verify that pending action was reset
+    assert controller._pending_action is None
+
+    # Verify that agent.reset() was called
+    mock_agent.reset.assert_called_once()
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_with_pending_action_stopped_state(mock_agent, mock_event_stream):
+    """Test reset() when there's a pending action and agent state is STOPPED."""
+    controller = AgentController(
+        agent=mock_agent,
+        event_stream=mock_event_stream,
+        iteration_delta=10,
+        sid='test',
+        confirmation_mode=False,
+        headless_mode=True,
+    )
+
+    mock_event_stream.add_event.assert_called_once()  # add SystemMessageAction
+    mock_event_stream.add_event.reset_mock()
+
+    # Create a pending action with tool call metadata
+    pending_action = CmdRunAction(command='test')
+    pending_action.tool_call_metadata = {
+        'function': 'test_function',
+        'args': {'arg1': 'value1'},
+    }
+    controller._pending_action = pending_action
+
+    # Set agent state to STOPPED
+    controller.state.agent_state = AgentState.STOPPED
+
+    # Call reset
+    controller._reset()
+
+    # Verify that an ErrorObservation was added to the event stream
+    mock_event_stream.add_event.assert_called_once()
+    args, kwargs = mock_event_stream.add_event.call_args
+    error_obs, source = args
+    assert isinstance(error_obs, ErrorObservation)
+    assert error_obs.content == 'Stop button pressed. The action has not been executed.'
     assert error_obs.tool_call_metadata == pending_action.tool_call_metadata
     assert error_obs._cause == pending_action.id
     assert source == EventSource.AGENT
@@ -457,11 +671,14 @@ async def test_reset_with_pending_action_existing_observation(
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
     )
+
+    mock_event_stream.add_event.assert_called_once()  # add SystemMessageAction
+    mock_event_stream.add_event.reset_mock()
 
     # Create a pending action with tool call metadata
     pending_action = CmdRunAction(command='test')
@@ -496,11 +713,14 @@ async def test_reset_without_pending_action(mock_agent, mock_event_stream):
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
     )
+
+    # Reset the mock to clear the call from system message addition
+    mock_event_stream.add_event.reset_mock()
 
     # Call reset
     controller._reset()
@@ -524,11 +744,14 @@ async def test_reset_with_pending_action_no_metadata(
     controller = AgentController(
         agent=mock_agent,
         event_stream=mock_event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
     )
+
+    # Reset the mock to clear the call from system message addition
+    mock_event_stream.add_event.reset_mock()
 
     # Create a pending action without tool call metadata
     pending_action = CmdRunAction(command='test')
@@ -559,30 +782,33 @@ async def test_reset_with_pending_action_no_metadata(
 
 @pytest.mark.asyncio
 async def test_run_controller_max_iterations_has_metrics(
-    test_event_stream, mock_memory
+    test_event_stream, mock_memory, mock_agent
 ):
-    config = AppConfig(
+    config = OpenHandsConfig(
         max_iterations=3,
     )
     event_stream = test_event_stream
 
-    agent = MagicMock(spec=Agent)
-    agent.llm = MagicMock(spec=LLM)
-    agent.llm.metrics = Metrics()
-    agent.llm.config = config.get_llm_config()
+    mock_agent.llm = MagicMock(spec=LLM)
+    mock_agent.llm.metrics = Metrics()
+    mock_agent.llm.config = config.get_llm_config()
+
+    step_count = 0
 
     def agent_step_fn(state):
         print(f'agent_step_fn received state: {state}')
         # Mock the cost of the LLM
-        agent.llm.metrics.add_cost(10.0)
+        mock_agent.llm.metrics.add_cost(10.0)
         print(
-            f'agent.llm.metrics.accumulated_cost: {agent.llm.metrics.accumulated_cost}'
+            f'mock_agent.llm.metrics.accumulated_cost: {mock_agent.llm.metrics.accumulated_cost}'
         )
-        return CmdRunAction(command='ls')
+        nonlocal step_count
+        step_count += 1
+        return CmdRunAction(command=f'ls {step_count}')
 
-    agent.step = agent_step_fn
+    mock_agent.step = agent_step_fn
 
-    runtime = MagicMock(spec=Runtime)
+    runtime = MagicMock(spec=ActionExecutionClient)
 
     def on_event(event: Event):
         if isinstance(event, CmdRunAction):
@@ -594,6 +820,7 @@ async def test_run_controller_max_iterations_has_metrics(
 
     event_stream.subscribe(EventStreamSubscriber.RUNTIME, on_event, str(uuid4()))
     runtime.event_stream = event_stream
+    runtime.config = copy.deepcopy(config)
 
     def on_event_memory(event: Event):
         if isinstance(event, RecallAction):
@@ -611,19 +838,32 @@ async def test_run_controller_max_iterations_has_metrics(
         initial_user_action=MessageAction(content='Test message'),
         runtime=runtime,
         sid='test',
-        agent=agent,
+        agent=mock_agent,
         fake_user_response_fn=lambda _: 'repeat',
         memory=mock_memory,
     )
-    assert state.iteration == 3
+
+    state.metrics = mock_agent.llm.metrics
+    assert state.iteration_flag.current_value == 3
     assert state.agent_state == AgentState.ERROR
     assert (
         state.last_error
-        == 'RuntimeError: Agent reached maximum iteration in headless mode. Current iteration: 3, max iteration: 3'
+        == 'RuntimeError: Agent reached maximum iteration. Current iteration: 3, max iteration: 3'
     )
+    error_observations = test_event_stream.get_matching_events(
+        reverse=True, limit=1, event_types=(AgentStateChangedObservation)
+    )
+    assert len(error_observations) == 1
+    error_observation = error_observations[0]
+
     assert (
-        state.metrics.accumulated_cost == 10.0 * 3
-    ), f'Expected accumulated cost to be 30.0, but got {state.metrics.accumulated_cost}'
+        error_observation.reason
+        == 'RuntimeError: Agent reached maximum iteration. Current iteration: 3, max iteration: 3'
+    )
+
+    assert state.metrics.accumulated_cost == 10.0 * 3, (
+        f'Expected accumulated cost to be 30.0, but got {state.metrics.accumulated_cost}'
+    )
 
 
 @pytest.mark.asyncio
@@ -632,77 +872,224 @@ async def test_notify_on_llm_retry(mock_agent, mock_event_stream, mock_status_ca
         agent=mock_agent,
         event_stream=mock_event_stream,
         status_callback=mock_status_callback,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
     )
-    controller._notify_on_llm_retry(1, 2)
-    controller.status_callback.assert_called_once_with('info', 'STATUS$LLM_RETRY', ANY)
+
+    def notify_on_llm_retry(attempt, max_attempts):
+        controller.status_callback('info', RuntimeStatus.LLM_RETRY, ANY)
+
+    # Attach the retry listener to the agent's LLM
+    controller.agent.llm.retry_listener = notify_on_llm_retry
+
+    controller.agent.llm.retry_listener(1, 2)
+    controller.status_callback.assert_called_once_with(
+        'info', RuntimeStatus.LLM_RETRY, ANY
+    )
     await controller.close()
 
 
 @pytest.mark.asyncio
-async def test_context_window_exceeded_error_handling(mock_agent, mock_event_stream):
-    """Test that context window exceeded errors are handled correctly by truncating history."""
+@pytest.mark.parametrize(
+    'context_window_error',
+    [
+        ContextWindowExceededError(
+            message='prompt is too long: 233885 tokens > 200000 maximum',
+            model='',
+            llm_provider='',
+        ),
+        BadRequestError(
+            message='litellm.BadRequestError: OpenrouterException - This endpoint\'s maximum context length is 40960 tokens. However, you requested about 42988 tokens (38892 of text input, 4096 in the output). Please reduce the length of either one, or use the "middle-out" transform to compress your prompt automatically.',
+            model='openrouter/qwen/qwen3-30b-a3b',
+            llm_provider='openrouter',
+        ),
+    ],
+)
+async def test_context_window_exceeded_error_handling(
+    context_window_error, mock_agent, mock_runtime, test_event_stream, mock_memory
+):
+    """Test that context window exceeded errors are handled correctly by the controller, providing a smaller view but keeping the history intact."""
+    max_iterations = 5
+    error_after = 2
 
     class StepState:
         def __init__(self):
             self.has_errored = False
+            self.index = 0
+            self.views = []
+            self.condenser = ConversationWindowCondenser()
 
         def step(self, state: State):
-            # Append a few messages to the history -- these will be truncated when we throw the error
-            state.history = [
-                MessageAction(content='Test message 0'),
-                MessageAction(content='Test message 1'),
-            ]
+            match self.condenser.condense(state.view):
+                case View() as view:
+                    self.views.append(view)
 
-            error = ContextWindowExceededError(
+                case Condensation(action=action):
+                    return action
+
+            # Wait until the right step to throw the error, and make sure we
+            # only throw it once.
+            if self.index < error_after or self.has_errored:
+                self.index += 1
+                return MessageAction(content=f'Test message {self.index}')
+
+            ContextWindowExceededError(
                 message='prompt is too long: 233885 tokens > 200000 maximum',
                 model='',
                 llm_provider='',
             )
             self.has_errored = True
-            raise error
+            raise context_window_error
 
-    state = StepState()
-    mock_agent.step = state.step
+    step_state = StepState()
+    mock_agent.step = step_state.step
     mock_agent.config = AgentConfig()
 
-    controller = AgentController(
-        agent=mock_agent,
-        event_stream=mock_event_stream,
-        max_iterations=10,
-        sid='test',
-        confirmation_mode=False,
-        headless_mode=True,
+    # Because we're sending message actions, we need to respond to the recall
+    # actions that get generated as a response.
+
+    # We do that by playing the role of the recall module -- subscribe to the
+    # event stream and respond to recall actions by inserting fake recall
+    # observations.
+    def on_event_memory(event: Event):
+        if isinstance(event, RecallAction):
+            microagent_obs = RecallObservation(
+                content='Test microagent content',
+                recall_type=RecallType.KNOWLEDGE,
+            )
+            microagent_obs._cause = event.id  # type: ignore
+            test_event_stream.add_event(microagent_obs, EventSource.ENVIRONMENT)
+
+    test_event_stream.subscribe(
+        EventStreamSubscriber.MEMORY, on_event_memory, str(uuid4())
+    )
+    config = OpenHandsConfig(max_iterations=max_iterations)
+    mock_runtime.event_stream = test_event_stream
+    mock_runtime.config = copy.deepcopy(config)
+
+    # Now we can run the controller for a fixed number of steps. Since the step
+    # state is set to error out before then, if this terminates and we have a
+    # record of the error being thrown we can be confident that the controller
+    # handles the truncation correctly.
+    final_state = await asyncio.wait_for(
+        run_controller(
+            config=config,
+            initial_user_action=MessageAction(content='INITIAL'),
+            runtime=mock_runtime,
+            sid='test',
+            agent=mock_agent,
+            fake_user_response_fn=lambda _: 'repeat',
+            memory=mock_memory,
+        ),
+        timeout=10,
     )
 
-    # Set the agent running and take a step in the controller -- this is similar
-    # to taking a single step using `run_controller`, but much easier to control
-    # termination for testing purposes
-    controller.state.agent_state = AgentState.RUNNING
-    await controller._step()
+    # Check that the context window exception was thrown and the controller
+    # called the agent's `step` function the right number of times.
+    assert step_state.has_errored
+    assert len(step_state.views) == max_iterations - 1
+    print('step_state.views: ', step_state.views)
 
-    # Check that the error was thrown and the history has been truncated
-    assert state.has_errored
-    assert controller.state.history == [MessageAction(content='Test message 1')]
+    # Look at pre/post-step views. Normally, these should always increase in
+    # size (because we return a message action, which triggers a recall, which
+    # triggers a recall response). But if the pre/post-views are on the turn
+    # when we throw the context window exceeded error, we should see the
+    # post-step view compressed (condensation effects should be visible).
+    for index, (first_view, second_view) in enumerate(
+        zip(step_state.views[:-1], step_state.views[1:])
+    ):
+        if index == error_after:
+            # Verify that no CondensationAction is present in either view
+            # (CondensationAction events are never included in views)
+            assert not any(isinstance(e, CondensationAction) for e in first_view.events)
+            assert not any(
+                isinstance(e, CondensationAction) for e in second_view.events
+            )
+            # The view length should be compressed due to condensation effects
+            assert len(first_view) > len(second_view)
+        else:
+            # Before the error, the view length should increase
+            assert len(first_view) < len(second_view)
+
+    # The final state's history should contain:
+    # - (max_iterations - 1) number of message actions (one iteration taken up with the condensation request)
+    # - 1 recall actions,
+    # - 1 recall observations,
+    # - 1 condensation action.
+    assert (
+        len(
+            [event for event in final_state.history if isinstance(event, MessageAction)]
+        )
+        == max_iterations - 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in final_state.history
+                if isinstance(event, MessageAction)
+                and event.source == EventSource.AGENT
+            ]
+        )
+        == max_iterations - 2
+    )
+    assert (
+        len([event for event in final_state.history if isinstance(event, RecallAction)])
+        == 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in final_state.history
+                if isinstance(event, RecallObservation)
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in final_state.history
+                if isinstance(event, CondensationAction)
+            ]
+        )
+        == 1
+    )
+    # With the refactored system message handling, we now have max_iterations + 4 events
+    assert (
+        len(final_state.history) == max_iterations + 4
+    )  # 1 system message, 1 condensation action, 1 recall action, 1 recall observation
+
+    assert len(final_state.view) == len(step_state.views[-1]) + 1
+
+    # And these two representations of the state are _not_ the same.
+    assert len(final_state.history) != len(final_state.view)
 
 
 @pytest.mark.asyncio
 async def test_run_controller_with_context_window_exceeded_with_truncation(
     mock_agent, mock_runtime, mock_memory, test_event_stream
 ):
-    """Tests that the controller can make progress after handling context window exceeded errors, as long as enable_history_truncation is ON"""
+    """Tests that the controller can make progress after handling context window exceeded errors, as long as enable_history_truncation is ON."""
 
     class StepState:
         def __init__(self):
             self.has_errored = False
+            self.condenser = ConversationWindowCondenser()
 
         def step(self, state: State):
+            match self.condenser.condense(state.view):
+                case Condensation(action=action):
+                    return action
+                case _:
+                    pass
             # If the state has more than one message and we haven't errored yet,
             # throw the context window exceeded error
-            if len(state.history) > 1 and not self.has_errored:
+            if len(state.history) > 5 and not self.has_errored:
                 error = ContextWindowExceededError(
                     message='prompt is too long: 233885 tokens > 200000 maximum',
                     model='',
@@ -730,11 +1117,13 @@ async def test_run_controller_with_context_window_exceeded_with_truncation(
         EventStreamSubscriber.MEMORY, on_event_memory, str(uuid4())
     )
     mock_runtime.event_stream = test_event_stream
+    config = OpenHandsConfig(max_iterations=5)
+    mock_runtime.config = copy.deepcopy(config)
 
     try:
         state = await asyncio.wait_for(
             run_controller(
-                config=AppConfig(max_iterations=3),
+                config=config,
                 initial_user_action=MessageAction(content='INITIAL'),
                 runtime=mock_runtime,
                 sid='test',
@@ -754,11 +1143,11 @@ async def test_run_controller_with_context_window_exceeded_with_truncation(
 
     # Hitting the iteration limit indicates the controller is failing for the
     # expected reason
-    assert state.iteration == 3
+    assert state.iteration_flag.current_value == 5
     assert state.agent_state == AgentState.ERROR
     assert (
         state.last_error
-        == 'RuntimeError: Agent reached maximum iteration in headless mode. Current iteration: 3, max iteration: 3'
+        == 'RuntimeError: Agent reached maximum iteration. Current iteration: 5, max iteration: 5'
     )
 
     # Check that the context window exceeded error was raised during the run
@@ -807,10 +1196,12 @@ async def test_run_controller_with_context_window_exceeded_without_truncation(
         EventStreamSubscriber.MEMORY, on_event_memory, str(uuid4())
     )
     mock_runtime.event_stream = test_event_stream
+    config = OpenHandsConfig(max_iterations=3)
+    mock_runtime.config = copy.deepcopy(config)
     try:
         state = await asyncio.wait_for(
             run_controller(
-                config=AppConfig(max_iterations=3),
+                config=config,
                 initial_user_action=MessageAction(content='INITIAL'),
                 runtime=mock_runtime,
                 sid='test',
@@ -830,10 +1221,21 @@ async def test_run_controller_with_context_window_exceeded_without_truncation(
 
     # Hitting the iteration limit indicates the controller is failing for the
     # expected reason
-    assert state.iteration == 2
+    # With the refactored system message handling, the iteration count is different
+    assert state.iteration_flag.current_value == 1
     assert state.agent_state == AgentState.ERROR
     assert (
         state.last_error
+        == 'LLMContextWindowExceedError: Conversation history longer than LLM context window limit. Consider turning on enable_history_truncation config to avoid this error'
+    )
+
+    error_observations = test_event_stream.get_matching_events(
+        reverse=True, limit=1, event_types=(AgentStateChangedObservation)
+    )
+    assert len(error_observations) == 1
+    error_observation = error_observations[0]
+    assert (
+        error_observation.reason
         == 'LLMContextWindowExceedError: Conversation history longer than LLM context window limit. Consider turning on enable_history_truncation config to avoid this error'
     )
 
@@ -842,24 +1244,24 @@ async def test_run_controller_with_context_window_exceeded_without_truncation(
 
 
 @pytest.mark.asyncio
-async def test_run_controller_with_memory_error(test_event_stream):
-    config = AppConfig()
+async def test_run_controller_with_memory_error(test_event_stream, mock_agent):
+    config = OpenHandsConfig()
     event_stream = test_event_stream
 
-    # Create a propert agent that returns an action without an ID
-    agent = MagicMock(spec=Agent)
-    agent.llm = MagicMock(spec=LLM)
-    agent.llm.metrics = Metrics()
-    agent.llm.config = config.get_llm_config()
+    # Create a proper agent that returns an action without an ID
+    mock_agent.llm = MagicMock(spec=LLM)
+    mock_agent.llm.metrics = Metrics()
+    mock_agent.llm.config = config.get_llm_config()
 
     # Create a real action to return from the mocked step function
     def agent_step_fn(state):
         return MessageAction(content='Agent returned a message')
 
-    agent.step = agent_step_fn
+    mock_agent.step = agent_step_fn
 
-    runtime = MagicMock(spec=Runtime)
+    runtime = MagicMock(spec=ActionExecutionClient)
     runtime.event_stream = event_stream
+    runtime.config = copy.deepcopy(config)
 
     # Create a real Memory instance
     memory = Memory(event_stream=event_stream, sid='test-memory')
@@ -876,27 +1278,29 @@ async def test_run_controller_with_memory_error(test_event_stream):
             initial_user_action=MessageAction(content='Test message'),
             runtime=runtime,
             sid='test',
-            agent=agent,
+            agent=mock_agent,
             fake_user_response_fn=lambda _: 'repeat',
             memory=memory,
         )
 
-    assert state.iteration == 0
+    assert state.iteration_flag.current_value == 0
     assert state.agent_state == AgentState.ERROR
     assert state.last_error == 'Error: RuntimeError'
 
 
 @pytest.mark.asyncio
-async def test_action_metrics_copy():
+async def test_action_metrics_copy(mock_agent):
     # Setup
     file_store = InMemoryFileStore({})
     event_stream = EventStream(sid='test', file_store=file_store)
 
-    # Create agent with metrics
-    agent = MagicMock(spec=Agent)
-    agent.llm = MagicMock(spec=LLM)
     metrics = Metrics(model_name='test-model')
     metrics.accumulated_cost = 0.05
+
+    initial_state = State(metrics=metrics, budget_flag=None)
+
+    # Create agent with metrics
+    mock_agent.llm = MagicMock(spec=LLM)
 
     # Add multiple token usages - we should get the last one in the action
     usage1 = TokenUsage(
@@ -919,6 +1323,16 @@ async def test_action_metrics_copy():
 
     metrics.token_usages = [usage1, usage2]
 
+    # Set the accumulated token usage
+    metrics._accumulated_token_usage = TokenUsage(
+        model='test-model',
+        prompt_tokens=15,  # 5 + 10
+        completion_tokens=30,  # 10 + 20
+        cache_read_tokens=7,  # 2 + 5
+        cache_write_tokens=7,  # 2 + 5
+        response_id='accumulated',
+    )
+
     # Add a cost instance - should not be included in action metrics
     # This will increase accumulated_cost by 0.02
     metrics.add_cost(0.02)
@@ -926,7 +1340,7 @@ async def test_action_metrics_copy():
     # Add a response latency - should not be included in action metrics
     metrics.add_response_latency(0.5, 'test-id-2')
 
-    agent.llm.metrics = metrics
+    mock_agent.llm.metrics = metrics
 
     # Mock agent step to return an action
     action = MessageAction(content='Test message')
@@ -934,16 +1348,17 @@ async def test_action_metrics_copy():
     def agent_step_fn(state):
         return action
 
-    agent.step = agent_step_fn
+    mock_agent.step = agent_step_fn
 
     # Create controller with correct parameters
     controller = AgentController(
-        agent=agent,
+        agent=mock_agent,
         event_stream=event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
+        initial_state=initial_state,
     )
 
     # Execute one step
@@ -961,13 +1376,20 @@ async def test_action_metrics_copy():
         last_action.llm_metrics.accumulated_cost == 0.07
     )  # 0.05 initial + 0.02 from add_cost
 
-    # Should include the last token usage
-    assert len(last_action.llm_metrics.token_usages) == 1
-    assert last_action.llm_metrics.token_usages[0].prompt_tokens == 10
-    assert last_action.llm_metrics.token_usages[0].completion_tokens == 20
-    assert last_action.llm_metrics.token_usages[0].cache_read_tokens == 5
-    assert last_action.llm_metrics.token_usages[0].cache_write_tokens == 5
-    assert last_action.llm_metrics.token_usages[0].response_id == 'test-id-2'
+    # Should not include individual token usages anymore (after the fix)
+    assert len(last_action.llm_metrics.token_usages) == 0
+
+    # But should include the accumulated token usage
+    assert last_action.llm_metrics.accumulated_token_usage.prompt_tokens == 15  # 5 + 10
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.completion_tokens == 30
+    )  # 10 + 20
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.cache_read_tokens == 7
+    )  # 2 + 5
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.cache_write_tokens == 7
+    )  # 2 + 5
 
     # Should not include the cost history
     assert len(last_action.llm_metrics.costs) == 0
@@ -982,34 +1404,125 @@ async def test_action_metrics_copy():
     assert not hasattr(last_action.llm_metrics, 'average_latency')
 
     # Verify it's a deep copy by modifying the original
-    agent.llm.metrics.accumulated_cost = 0.1
+    mock_agent.llm.metrics.accumulated_cost = 0.1
     assert last_action.llm_metrics.accumulated_cost == 0.07
 
     await controller.close()
 
 
 @pytest.mark.asyncio
-async def test_first_user_message_with_identical_content():
-    """
-    Test that _first_user_message correctly identifies the first user message
-    even when multiple messages have identical content but different IDs.
+async def test_condenser_metrics_included(mock_agent, test_event_stream):
+    """Test that metrics from the condenser's LLM are included in the action metrics."""
+    # Set up agent metrics
+    agent_metrics = Metrics(model_name='agent-model')
+    agent_metrics.accumulated_cost = 0.05
+    agent_metrics._accumulated_token_usage = TokenUsage(
+        model='agent-model',
+        prompt_tokens=100,
+        completion_tokens=50,
+        cache_read_tokens=10,
+        cache_write_tokens=10,
+        response_id='agent-accumulated',
+    )
+    # mock_agent.llm.metrics = agent_metrics
+    mock_agent.name = 'TestAgent'
+
+    # Create condenser with its own metrics
+    condenser = MagicMock()
+    condenser.llm = MagicMock(spec=LLM)
+    condenser_metrics = Metrics(model_name='condenser-model')
+    condenser_metrics.accumulated_cost = 0.03
+    condenser_metrics._accumulated_token_usage = TokenUsage(
+        model='condenser-model',
+        prompt_tokens=200,
+        completion_tokens=100,
+        cache_read_tokens=20,
+        cache_write_tokens=5000,  # High cache_write value that should be preserved
+        response_id='condenser-accumulated',
+    )
+    condenser.llm.metrics = condenser_metrics
+
+    # Attach the condenser to the mock_agent
+    mock_agent.condenser = condenser
+
+    # Create a real CondensationAction
+    action = CondensationAction(
+        forgotten_events_start_id=1,
+        forgotten_events_end_id=5,
+        summary='Test summary',
+        summary_offset=1,
+    )
+    action._source = EventSource.AGENT  # Required for event_stream.add_event
+
+    def agent_step_fn(state):
+        return action
+
+    mock_agent.step = agent_step_fn
+
+    # Create controller with correct parameters
+    controller = AgentController(
+        agent=mock_agent,
+        event_stream=test_event_stream,
+        iteration_delta=10,
+        sid='test',
+        confirmation_mode=False,
+        headless_mode=True,
+        initial_state=State(metrics=agent_metrics, budget_flag=None),
+    )
+
+    # Execute one step
+    controller.state.agent_state = AgentState.RUNNING
+    await controller._step()
+
+    # Get the last event from event stream
+    events = list(test_event_stream.get_events())
+    assert len(events) > 0
+    last_action = events[-1]
+
+    # Verify metrics were copied correctly
+    assert last_action.llm_metrics is not None
+
+    # Verify that both agent and condenser metrics are included
+    assert (
+        last_action.llm_metrics.accumulated_cost == 0.08
+    )  # 0.05 from agent + 0.03 from condenser
+
+    # The accumulated token usage should include both agent and condenser metrics
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.prompt_tokens == 300
+    )  # 100 + 200
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.completion_tokens == 150
+    )  # 50 + 100
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.cache_read_tokens == 30
+    )  # 10 + 20
+    assert (
+        last_action.llm_metrics.accumulated_token_usage.cache_write_tokens == 5010
+    )  # 10 + 5000
+
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_first_user_message_with_identical_content(test_event_stream, mock_agent):
+    """Test that _first_user_message correctly identifies the first user message.
+
+    This test verifies that messages with identical content but different IDs are properly
+    distinguished, and that the result is correctly cached.
 
     The issue we're checking is that the comparison (action == self._first_user_message())
     should correctly differentiate between messages with the same content but different IDs.
     """
-    # Create a real event stream for this test
-    event_stream = EventStream(sid='test', file_store=InMemoryFileStore({}))
-
     # Create an agent controller
-    mock_agent = MagicMock(spec=Agent)
     mock_agent.llm = MagicMock(spec=LLM)
     mock_agent.llm.metrics = Metrics()
-    mock_agent.llm.config = AppConfig().get_llm_config()
+    mock_agent.llm.config = OpenHandsConfig().get_llm_config()
 
     controller = AgentController(
         agent=mock_agent,
-        event_stream=event_stream,
-        max_iterations=10,
+        event_stream=test_event_stream,
+        iteration_delta=10,
         sid='test',
         confirmation_mode=False,
         headless_mode=True,
@@ -1018,12 +1531,12 @@ async def test_first_user_message_with_identical_content():
     # Create and add the first user message
     first_message = MessageAction(content='Hello, this is a test message')
     first_message._source = EventSource.USER
-    event_stream.add_event(first_message, EventSource.USER)
+    test_event_stream.add_event(first_message, EventSource.USER)
 
     # Create and add a second user message with identical content
     second_message = MessageAction(content='Hello, this is a test message')
     second_message._source = EventSource.USER
-    event_stream.add_event(second_message, EventSource.USER)
+    test_event_stream.add_event(second_message, EventSource.USER)
 
     # Verify that _first_user_message returns the first message
     first_user_message = controller._first_user_message()
@@ -1038,9 +1551,24 @@ async def test_first_user_message_with_identical_content():
         second_message.id != first_user_message.id
     )  # This should be False, but may be True if there's a bug
 
+    # Verify caching behavior
+    assert (
+        controller._cached_first_user_message is not None
+    )  # Cache should be populated
+    assert (
+        controller._cached_first_user_message is first_user_message
+    )  # Cache should store the same object
+
+    # Mock get_events to verify it's not called again
+    with patch.object(test_event_stream, 'get_events') as mock_get_events:
+        cached_message = controller._first_user_message()
+        assert cached_message is first_user_message  # Should return cached object
+        mock_get_events.assert_not_called()  # Should not call get_events again
+
     await controller.close()
 
 
+@pytest.mark.asyncio
 async def test_agent_controller_processes_null_observation_with_cause():
     """Test that AgentController processes NullObservation events with a cause value.
 
@@ -1055,27 +1583,30 @@ async def test_agent_controller_processes_null_observation_with_cause():
 
     # Create a mock agent with necessary attributes
     mock_agent = MagicMock(spec=Agent)
+    mock_agent.get_system_message = MagicMock(
+        return_value=None,
+    )
     mock_agent.llm = MagicMock(spec=LLM)
     mock_agent.llm.metrics = Metrics()
-    mock_agent.llm.config = AppConfig().get_llm_config()
+    mock_agent.llm.config = OpenHandsConfig().get_llm_config()
 
     # Create a controller with the mock agent
     controller = AgentController(
         agent=mock_agent,
         event_stream=event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test-session',
     )
 
     # Patch the controller's step method to track calls
-    with patch.object(controller, 'step') as mock_step:
+    with patch.object(controller, '_step') as mock_step:
         # Create and add the first user message (will have ID 0)
         user_message = MessageAction(content='First user message')
         user_message._source = EventSource.USER  # type: ignore[attr-defined]
         event_stream.add_event(user_message, EventSource.USER)
 
         # Give it a little time to process
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1)
 
         # Get all events from the stream
         events = list(event_stream.get_events())
@@ -1100,14 +1631,14 @@ async def test_agent_controller_processes_null_observation_with_cause():
 
         # Verify the NullObservation has a cause that points to the RecallAction
         assert null_observation.cause is not None, 'NullObservation cause is None'
-        assert (
-            null_observation.cause == recall_action.id
-        ), f'Expected cause={recall_action.id}, got cause={null_observation.cause}'
+        assert null_observation.cause == recall_action.id, (
+            f'Expected cause={recall_action.id}, got cause={null_observation.cause}'
+        )
 
         # Verify the controller's should_step method returns True for this observation
-        assert controller.should_step(
-            null_observation
-        ), 'should_step should return True for this NullObservation'
+        assert controller.should_step(null_observation), (
+            'should_step should return True for this NullObservation'
+        )
 
         # Verify the controller's step method was called
         # This means the controller processed the NullObservation
@@ -1119,25 +1650,22 @@ async def test_agent_controller_processes_null_observation_with_cause():
         null_observation_zero._cause = 0  # type: ignore[attr-defined]
 
         # Verify the controller's should_step method would return False for this observation
-        assert not controller.should_step(
-            null_observation_zero
-        ), 'should_step should return False for NullObservation with cause=0'
+        assert not controller.should_step(null_observation_zero), (
+            'should_step should return False for NullObservation with cause=0'
+        )
 
 
-def test_agent_controller_should_step_with_null_observation_cause_zero():
+def test_agent_controller_should_step_with_null_observation_cause_zero(mock_agent):
     """Test that AgentController's should_step method returns False for NullObservation with cause = 0."""
     # Create a mock event stream
     file_store = InMemoryFileStore()
     event_stream = EventStream(sid='test-session', file_store=file_store)
 
-    # Create a mock agent
-    mock_agent = MagicMock(spec=Agent)
-
     # Create an agent controller
     controller = AgentController(
         agent=mock_agent,
         event_stream=event_stream,
-        max_iterations=10,
+        iteration_delta=10,
         sid='test-session',
     )
 
@@ -1150,6 +1678,22 @@ def test_agent_controller_should_step_with_null_observation_cause_zero():
     result = controller.should_step(null_observation)
 
     # It should return False since we only want to step on NullObservation with cause > 0
-    assert (
-        result is False
-    ), 'should_step should return False for NullObservation with cause = 0'
+    assert result is False, (
+        'should_step should return False for NullObservation with cause = 0'
+    )
+
+
+def test_system_message_in_event_stream(mock_agent, test_event_stream):
+    """Test that SystemMessageAction is added to event stream in AgentController."""
+    _ = AgentController(
+        agent=mock_agent, event_stream=test_event_stream, iteration_delta=10
+    )
+
+    # Get events from the event stream
+    events = list(test_event_stream.get_events())
+
+    # Verify system message was added to event stream
+    assert len(events) == 1
+    assert isinstance(events[0], SystemMessageAction)
+    assert events[0].content == 'Test system message'
+    assert events[0].tools == ['test_tool']

@@ -41,7 +41,7 @@ from evaluation.utils.shared import (
     reset_logger_for_multiprocessing,
     run_evaluation,
 )
-from openhands.core.config import AppConfig, SandboxConfig, get_parser
+from openhands.core.config import OpenHandsConfig, SandboxConfig, get_evaluation_parser
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime
 from openhands.events.action import CmdRunAction
@@ -52,13 +52,13 @@ DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/kdja
 logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
 
 
-def get_config(instance: pd.Series) -> AppConfig:
+def get_config(instance: pd.Series) -> OpenHandsConfig:
     base_container_image = get_instance_docker_image(instance['instance_id_swebench'])
-    assert (
-        base_container_image
-    ), f"Invalid container image for instance {instance['instance_id_swebench']}."
+    assert base_container_image, (
+        f'Invalid container image for instance {instance["instance_id_swebench"]}.'
+    )
     logger.info(f'Using instance container image: {base_container_image}.')
-    return AppConfig(
+    return OpenHandsConfig(
         run_as_openhands=False,
         runtime=os.environ.get('RUNTIME', 'eventstream'),
         sandbox=SandboxConfig(
@@ -183,17 +183,16 @@ def run_mutation_testing(
     mutation_action = CmdRunAction(command=f'cat {log_file}')
     mutation_action.set_hard_timeout(300)
     mutation_obs = runtime.run_action(mutation_action)
-    assert isinstance(
-        mutation_obs, CmdOutputObservation
-    ), 'Failed to retrieve mutation output.'
+    assert isinstance(mutation_obs, CmdOutputObservation), (
+        'Failed to retrieve mutation output.'
+    )
     return mutation_obs.exit_code, mutation_obs.content
 
 
 def grade_test_output(
     test_suite: str, instance: pd.Series, test_output: str, test_spec: TestSpec, runtime
 ):
-    """
-    Two-pass test grading with short-circuiting:
+    """Two-pass test grading with short-circuiting:
     1. Run all tests to identify passing/failing tests
     2. If no failing tests, evaluate coverage immediately
     3. Otherwise, run only passing tests for coverage analysis
@@ -280,8 +279,7 @@ def process_instance(
     reset_logger: bool = True,
     log_dir: str | None = None,
 ) -> EvalOutput:
-    """
-    Evaluate agent performance on a TestGenEval problem instance.
+    """Evaluate agent performance on a TestGenEval problem instance.
 
     Note that this signature differs from the expected input to `run_evaluation`. Use
     `functools.partial` to provide optional arguments before passing to the evaluation harness.
@@ -294,9 +292,9 @@ def process_instance(
         AssertionError: if the `reset_logger` flag is set without a provided log directory.
     """
     if reset_logger:
-        assert (
-            log_dir is not None
-        ), "Can't reset logger without a provided log directory."
+        assert log_dir is not None, (
+            "Can't reset logger without a provided log directory."
+        )
         os.makedirs(log_dir, exist_ok=True)
         reset_logger_for_multiprocessing(logger, instance.instance_id, log_dir)
     else:
@@ -453,8 +451,7 @@ def process_instance(
 
 
 def count_and_log_fields(evaluated_predictions, fields, key):
-    """
-    Count and log the sum of specified fields in the evaluated predictions,
+    """Count and log the sum of specified fields in the evaluated predictions,
     ignoring fields with a value of -1. If all values for a field are -1,
     return -1.
 
@@ -484,7 +481,7 @@ def count_and_log_fields(evaluated_predictions, fields, key):
 
 
 if __name__ == '__main__':
-    parser = get_parser()
+    parser = get_evaluation_parser()
     parser.add_argument(
         '--input-file', type=str, required=True, help='Path to input predictions file'
     )
@@ -528,9 +525,9 @@ if __name__ == '__main__':
     # Load predictions
     assert args.input_file.endswith('.jsonl'), 'Input file must be a jsonl file.'
     predictions = pd.read_json(args.input_file, lines=True)
-    assert (
-        'instance_id' in predictions.columns
-    ), 'Input file must contain instance_id column.'
+    assert 'instance_id' in predictions.columns, (
+        'Input file must contain instance_id column.'
+    )
 
     if 'test_suite' not in predictions.columns and (
         'test_result' in predictions.columns
@@ -562,9 +559,9 @@ if __name__ == '__main__':
             lambda x: x['test_suite']
         )
 
-    assert len(predictions['instance_id'].unique()) == len(
-        predictions
-    ), 'instance_id column must be unique.'
+    assert len(predictions['instance_id'].unique()) == len(predictions), (
+        'instance_id column must be unique.'
+    )
 
     assert {'instance_id_swebench', 'test_suite', 'instance_id'}.issubset(
         set(predictions.columns)

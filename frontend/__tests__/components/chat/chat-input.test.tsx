@@ -193,9 +193,9 @@ describe("ChatInput", () => {
 
   it("should handle image paste correctly", () => {
     const onSubmit = vi.fn();
-    const onImagePaste = vi.fn();
+    const onFilesPaste = vi.fn();
 
-    render(<ChatInput onSubmit={onSubmit} onImagePaste={onImagePaste} />);
+    render(<ChatInput onSubmit={onSubmit} onFilesPaste={onFilesPaste} />);
 
     const input = screen.getByTestId("chat-input").querySelector("textarea");
     expect(input).toBeTruthy();
@@ -213,8 +213,19 @@ describe("ChatInput", () => {
       },
     });
 
-    // Verify image paste was handled
-    expect(onImagePaste).toHaveBeenCalledWith([file]);
+    // Verify file paste was handled
+    expect(onFilesPaste).toHaveBeenCalledWith([file]);
+  });
+
+  it("should use the default maxRows value", () => {
+    // We can't directly test the maxRows prop as it's not exposed in the DOM
+    // Instead, we'll verify the component renders with the default props
+    render(<ChatInput onSubmit={onSubmitMock} />);
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toBeInTheDocument();
+
+    // The actual verification of maxRows=16 is handled internally by the TextareaAutosize component
+    // and affects how many rows the textarea can expand to
   });
 
   it("should not submit when Enter is pressed during IME composition", async () => {

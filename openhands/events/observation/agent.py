@@ -10,6 +10,7 @@ class AgentStateChangedObservation(Observation):
     """This data class represents the result from delegating to another agent"""
 
     agent_state: str
+    reason: str = ''
     observation: str = ObservationType.AGENT_STATE_CHANGED
 
     @property
@@ -45,8 +46,7 @@ class AgentThinkObservation(Observation):
 
 @dataclass
 class MicroagentKnowledge:
-    """
-    Represents knowledge from a triggered microagent.
+    """Represents knowledge from a triggered microagent.
 
     Attributes:
         name: The name of the microagent that was triggered
@@ -69,9 +69,14 @@ class RecallObservation(Observation):
     # workspace context
     repo_name: str = ''
     repo_directory: str = ''
+    repo_branch: str = ''
     repo_instructions: str = ''
     runtime_hosts: dict[str, int] = field(default_factory=dict)
     additional_agent_instructions: str = ''
+    date: str = ''
+    custom_secrets_descriptions: dict[str, str] = field(default_factory=dict)
+    conversation_instructions: str = ''
+    working_dir: str = ''
 
     # knowledge
     microagent_knowledge: list[MicroagentKnowledge] = field(default_factory=list)
@@ -112,6 +117,9 @@ class RecallObservation(Observation):
                     f'repo_instructions={self.repo_instructions[:20]}...',
                     f'runtime_hosts={self.runtime_hosts}',
                     f'additional_agent_instructions={self.additional_agent_instructions[:20]}...',
+                    f'date={self.date}'
+                    f'custom_secrets_descriptions={self.custom_secrets_descriptions}',
+                    f'conversation_instructions={self.conversation_instructions[0:20]}...',
                 ]
             )
         else:

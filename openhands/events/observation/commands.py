@@ -2,7 +2,7 @@ import json
 import re
 import traceback
 from dataclasses import dataclass, field
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel
 
@@ -16,6 +16,11 @@ CMD_OUTPUT_METADATA_PS1_REGEX = re.compile(
     f'^{CMD_OUTPUT_PS1_BEGIN.strip()}(.*?){CMD_OUTPUT_PS1_END.strip()}',
     re.DOTALL | re.MULTILINE,
 )
+
+# Default max size for command output content
+# to prevent too large observations from being saved in the stream
+# This matches the default max_message_chars in LLMConfig
+MAX_CMD_OUTPUT_SIZE: int = 30000
 
 
 class CmdOutputMetadata(BaseModel):
@@ -105,11 +110,15 @@ class CmdOutputObservation(Observation):
         content: str,
         command: str,
         observation: str = ObservationType.RUN,
-        metadata: dict | CmdOutputMetadata | None = None,
+        metadata: dict[str, Any] | CmdOutputMetadata | None = None,
         hidden: bool = False,
-        **kwargs,
-    ):
-        super().__init__(content)
+        **kwargs: Any,
+    ) -> None:
+        # Truncate content before passing it to parent
+        truncated_content = self._maybe_truncate(content)
+
+        super().__init__(truncated_content)
+
         self.command = command
         self.observation = observation
         self.hidden = hidden
@@ -123,6 +132,35 @@ class CmdOutputObservation(Observation):
             self.metadata.exit_code = kwargs['exit_code']
         if 'command_id' in kwargs:
             self.metadata.pid = kwargs['command_id']
+
+    @staticmethod
+    def _maybe_truncate(content: str, max_size: int = MAX_CMD_OUTPUT_SIZE) -> str:
+        """Truncate the content if it's too large.
+
+        This helps avoid storing unnecessarily large content in the event stream.
+
+        Args:
+            content: The content to truncate
+            max_size: Maximum size before truncation. Defaults to MAX_CMD_OUTPUT_SIZE.
+
+        Returns:
+            Original content if not too large, or truncated content otherwise
+        """
+        if len(content) <= max_size:
+            return content
+
+        # Truncate the middle and include a message about it
+        half = max_size // 2
+        original_length = len(content)
+        truncated = (
+            content[:half]
+            + '\n[... Observation truncated due to length ...]\n'
+            + content[-half:]
+        )
+        logger.debug(
+            f'Truncated large command output: {original_length} -> {len(truncated)} chars'
+        )
+        return truncated
 
     @property
     def command_id(self) -> int:
@@ -170,6 +208,7 @@ class IPythonRunCellObservation(Observation):
 
     code: str
     observation: str = ObservationType.RUN_IPYTHON
+    image_urls: list[str] | None = None
 
     @property
     def error(self) -> bool:
@@ -184,4 +223,7 @@ class IPythonRunCellObservation(Observation):
         return True  # IPython cells are always considered successful
 
     def __str__(self) -> str:
-        return f'**IPythonRunCellObservation**\n{self.content}'
+        result = f'**IPythonRunCellObservation**\n{self.content}'
+        if self.image_urls:
+            result += f'\nImages: {len(self.image_urls)}'
+        return result
