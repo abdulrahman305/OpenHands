@@ -45,7 +45,6 @@ from openhands.server.services.conversation_service import (
     setup_init_conversation_settings,
 )
 from openhands.server.shared import (
-    ConversationManagerImpl,
     ConversationStoreImpl,
     config,
     conversation_manager,
@@ -227,19 +226,6 @@ async def new_conversation(
     if auth_type == AuthType.BEARER:
         conversation_trigger = ConversationTrigger.REMOTE_API_KEY
 
-    if (
-        conversation_trigger == ConversationTrigger.REMOTE_API_KEY
-        and not initial_user_msg
-    ):
-        return JSONResponse(
-            content={
-                'status': 'error',
-                'message': 'Missing initial user message',
-                'msg_id': 'CONFIGURATION$MISSING_USER_MESSAGE',
-            },
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
-
     try:
         if repository:
             provider_handler = ProviderHandler(provider_tokens)
@@ -397,7 +383,7 @@ async def get_prompt(
     )
 
     prompt_template = generate_prompt_template(stringified_events)
-    prompt = generate_prompt(llm_config, prompt_template, conversation_id)
+    prompt = await generate_prompt(llm_config, prompt_template, conversation_id)
 
     return JSONResponse(
         {
@@ -413,7 +399,7 @@ def generate_prompt_template(events: str) -> str:
     return template.render(events=events)
 
 
-def generate_prompt(
+async def generate_prompt(
     llm_config: LLMConfig, prompt_template: str, conversation_id: str
 ) -> str:
     messages = [
@@ -427,7 +413,7 @@ def generate_prompt(
         },
     ]
 
-    raw_prompt = ConversationManagerImpl.request_llm_completion(
+    raw_prompt = await conversation_manager.request_llm_completion(
         'remember_prompt', conversation_id, llm_config, messages
     )
     prompt = re.search(r'<update_prompt>(.*?)</update_prompt>', raw_prompt, re.DOTALL)
@@ -476,6 +462,7 @@ async def start_conversation(
     providers_set: ProvidersSetModel,
     conversation_id: str = Depends(validate_conversation_id),
     user_id: str = Depends(get_user_id),
+    provider_tokens: PROVIDER_TOKEN_TYPE = Depends(get_provider_tokens),
     settings: Settings = Depends(get_user_settings),
     conversation_store: ConversationStore = Depends(get_conversation_store),
 ) -> ConversationResponse:
@@ -485,7 +472,22 @@ async def start_conversation(
     to start a conversation. If the conversation is already running, it will
     return the existing agent loop info.
     """
-    logger.info(f'Starting conversation: {conversation_id}')
+    logger.info(
+        f'Starting conversation: {conversation_id}',
+        extra={'session_id': conversation_id},
+    )
+
+    # Log token fetch status
+    if provider_tokens:
+        logger.info(
+            f'/start endpoint: Fetched provider tokens: {list(provider_tokens.keys())}',
+            extra={'session_id': conversation_id},
+        )
+    else:
+        logger.warning(
+            '/start endpoint: No provider tokens fetched (provider_tokens is None/empty)',
+            extra={'session_id': conversation_id},
+        )
 
     try:
         # Check that the conversation exists
@@ -502,7 +504,7 @@ async def start_conversation(
 
         # Set up conversation init data with provider information
         conversation_init_data = await setup_init_conversation_settings(
-            user_id, conversation_id, providers_set.providers_set or []
+            user_id, conversation_id, providers_set.providers_set or [], provider_tokens
         )
 
         # Start the agent loop
