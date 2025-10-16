@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import traceback
 import uuid
 from enum import Enum
 from typing import Any
@@ -45,8 +46,8 @@ def split_bash_commands(commands: str) -> list[str]:
         logger.debug(
             f'Failed to parse bash commands\n'
             f'[input]: {commands}\n'
-            f'The original command will be returned as is.',
-            exc_info=True,
+            f'[warning]: {traceback.format_exc()}\n'
+            f'The original command will be returned as is.'
         )
         # If parsing fails, return the original commands
         return [commands]
@@ -164,8 +165,8 @@ def escape_bash_special_chars(command: str) -> str:
         logger.debug(
             f'Failed to parse bash commands for special characters escape\n'
             f'[input]: {command}\n'
-            f'The original command will be returned as is.',
-            exc_info=True,
+            f'[warning]: {traceback.format_exc()}\n'
+            f'The original command will be returned as is.'
         )
         return command
 
@@ -231,7 +232,7 @@ class BashSession:
 
         # Set history limit to a large number to avoid losing history
         # https://unix.stackexchange.com/questions/43414/unlimited-history-in-tmux
-        self.session.set_option('history-limit', str(self.HISTORY_LIMIT), global_=True)
+        self.session.set_option('history-limit', str(self.HISTORY_LIMIT), _global=True)
         self.session.history_limit = self.HISTORY_LIMIT
         # We need to create a new pane because the initial pane's history limit is (default) 2000
         _initial_window = self.session.active_window

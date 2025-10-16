@@ -7,7 +7,7 @@ import { TrajectoryActions } from "../trajectory/trajectory-actions";
 import { createChatMessage } from "#/services/chat-service";
 import { InteractiveChatBox } from "./interactive-chat-box";
 import { AgentState } from "#/types/agent-state";
-import { isOpenHandsAction, isActionOrObservation } from "#/types/core/guards";
+import { isOpenHandsAction } from "#/types/core/guards";
 import { generateAgentStateChangeEvent } from "#/services/agent-state-service";
 import { FeedbackModal } from "../feedback/feedback-modal";
 import { useScrollToBottom } from "#/hooks/use-scroll-to-bottom";
@@ -24,7 +24,6 @@ import { LoadingSpinner } from "#/components/shared/loading-spinner";
 import { displayErrorToast } from "#/utils/custom-toast-handlers";
 import { useErrorMessageStore } from "#/stores/error-message-store";
 import { useOptimisticUserMessageStore } from "#/stores/optimistic-user-message-store";
-import { useEventStore } from "#/stores/use-event-store";
 import { ErrorMessageBanner } from "./error-message-banner";
 import {
   hasUserEvent,
@@ -35,7 +34,6 @@ import { useConfig } from "#/hooks/query/use-config";
 import { validateFiles } from "#/utils/file-validation";
 import { useConversationStore } from "#/state/conversation-store";
 import ConfirmationModeEnabled from "./confirmation-mode-enabled";
-import { isV0Event } from "#/types/v1/type-guards";
 
 function getEntryPoint(
   hasRepository: boolean | null,
@@ -49,8 +47,7 @@ function getEntryPoint(
 export function ChatInterface() {
   const { setMessageToSend } = useConversationStore();
   const { errorMessage } = useErrorMessageStore();
-  const { send, isLoadingMessages } = useWsClient();
-  const storeEvents = useEventStore((state) => state.events);
+  const { send, isLoadingMessages, parsedEvents } = useWsClient();
   const { setOptimisticUserMessage, getOptimisticUserMessage } =
     useOptimisticUserMessageStore();
   const { t } = useTranslation();
@@ -77,24 +74,18 @@ export function ChatInterface() {
 
   const optimisticUserMessage = getOptimisticUserMessage();
 
-  const events = storeEvents
-    .filter(isV0Event)
-    .filter(isActionOrObservation)
-    .filter(shouldRenderEvent);
+  const events = parsedEvents.filter(shouldRenderEvent);
 
   // Check if there are any substantive agent actions (not just system messages)
   const hasSubstantiveAgentActions = React.useMemo(
     () =>
-      storeEvents
-        .filter(isV0Event)
-        .filter(isActionOrObservation)
-        .some(
-          (event) =>
-            isOpenHandsAction(event) &&
-            event.source === "agent" &&
-            event.action !== "system",
-        ),
-    [storeEvents],
+      parsedEvents.some(
+        (event) =>
+          isOpenHandsAction(event) &&
+          event.source === "agent" &&
+          event.action !== "system",
+      ),
+    [parsedEvents],
   );
 
   const handleSendMessage = async (

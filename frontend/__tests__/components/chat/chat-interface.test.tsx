@@ -23,7 +23,6 @@ import { useConfig } from "#/hooks/query/use-config";
 import { useGetTrajectory } from "#/hooks/mutation/use-get-trajectory";
 import { useUploadFiles } from "#/hooks/mutation/use-upload-files";
 import { OpenHandsAction } from "#/types/core/actions";
-import { useEventStore } from "#/stores/use-event-store";
 
 // Mock the hooks
 vi.mock("#/context/ws-client-provider");
@@ -177,7 +176,7 @@ describe("ChatInterface - Chat Suggestions", () => {
   });
 
   test("should hide chat suggestions when there is a user message", () => {
-    const mockUserEvent: OpenHandsAction = {
+    const userEvent: OpenHandsAction = {
       id: 1,
       source: "user",
       action: "message",
@@ -190,11 +189,10 @@ describe("ChatInterface - Chat Suggestions", () => {
       timestamp: "2025-07-01T00:00:00Z",
     };
 
-    useEventStore.setState({
-      events: [mockUserEvent],
-      uiEvents: [],
-      addEvent: vi.fn(),
-      clearEvents: vi.fn(),
+    (useWsClient as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+      send: vi.fn(),
+      isLoadingMessages: false,
+      parsedEvents: [userEvent],
     });
 
     renderWithQueryClient(<ChatInterface />, queryClient);

@@ -1,9 +1,9 @@
 from enum import Enum
 
-from openhands.sdk.llm import UNVERIFIED_MODELS_EXCLUDING_BEDROCK, VERIFIED_MODELS
 from prompt_toolkit.completion import FuzzyWordCompleter
 from pydantic import SecretStr
 
+from openhands.sdk.llm import UNVERIFIED_MODELS_EXCLUDING_BEDROCK, VERIFIED_MODELS
 from openhands_cli.tui.utils import StepCounter
 from openhands_cli.user_actions.utils import (
     NonEmptyValueValidator,
@@ -17,19 +17,13 @@ class SettingsType(Enum):
     ADVANCED = 'advanced'
 
 
-def settings_type_confirmation(first_time: bool = False) -> SettingsType:
-    question = (
-            '\nWelcome to OpenHands! Let\'s configure your LLM settings.\n'
-            'Choose your preferred setup method:'
-        )
+def settings_type_confirmation() -> SettingsType:
+    question = 'Which settings would you like to modify?'
     choices = [
         'LLM (Basic)',
-        'LLM (Advanced)'
+        'LLM (Advanced)',
+        'Go back',
     ]
-    if not first_time:
-        question = 'Which settings would you like to modify?'
-        choices.append('Go back')
-
 
     index = cli_confirm(question, choices, escapable=True)
 
@@ -123,15 +117,9 @@ def prompt_api_key(
         validator = NonEmptyValueValidator()
 
     question = helper_text + step_counter.next_step(question)
-    user_input = cli_text_input(
+    return cli_text_input(
         question, escapable=escapable, validator=validator, is_password=True
     )
-    
-    # If user pressed ENTER with existing key (empty input), return the existing key
-    if existing_api_key and not user_input.strip():
-        return existing_api_key.get_secret_value()
-    
-    return user_input
 
 
 # Advanced settings functions

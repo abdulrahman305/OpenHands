@@ -23,7 +23,7 @@ export function useUrlSearch(inputValue: string, provider: Provider) {
             );
 
             setUrlSearchResults(repositories);
-          } catch {
+          } catch (error) {
             setUrlSearchResults([]);
           } finally {
             setIsUrlSearchLoading(false);

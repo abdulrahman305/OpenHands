@@ -17,7 +17,6 @@ COMMANDS = {
     '/exit': 'Exit the application',
     '/help': 'Display available commands',
     '/clear': 'Clear the screen',
-    '/new': 'Start a fresh conversation',
     '/status': 'Display conversation details',
     '/confirm': 'Toggle confirmation mode on/off',
     '/resume': 'Resume a paused conversation',
@@ -56,6 +55,8 @@ def display_banner(conversation_id: str, resume: bool = False) -> None:
     </gold>"""),
         style=DEFAULT_STYLE,
     )
+
+    print_formatted_text(HTML(f'<grey>OpenHands CLI v{__version__}</grey>'))
 
     print_formatted_text('')
     if not resume:

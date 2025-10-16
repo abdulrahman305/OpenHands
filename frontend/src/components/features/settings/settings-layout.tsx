@@ -48,9 +48,7 @@ export function SettingsLayout({
         />
 
         {/* Main content */}
-        <main className="flex-1 overflow-auto custom-scrollbar-always">
-          {children}
-        </main>
+        <main className="flex-1 overflow-auto">{children}</main>
       </div>
     </div>
   );

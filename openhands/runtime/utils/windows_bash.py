@@ -6,6 +6,7 @@ way to manage PowerShell processes compared to using temporary script files.
 
 import os
 import time
+import traceback
 from pathlib import Path
 from threading import RLock
 
@@ -154,7 +155,8 @@ class WindowsPowershellSession:
             self._initialized = True  # Set to True only on successful initialization
             logger.info(f'PowerShell runspace created. Initial CWD set to: {self._cwd}')
         except Exception as e:
-            logger.exception(f'Failed to create or open PowerShell runspace: {e}')
+            logger.error(f'Failed to create or open PowerShell runspace: {e}')
+            logger.error(traceback.format_exc())
             self.close()  # Ensure cleanup if init fails partially
             raise RuntimeError(f'Failed to initialize PowerShell runspace: {e}')
 
@@ -175,7 +177,8 @@ class WindowsPowershellSession:
                 # Optional: Confirm CWD even on success for robustness
                 # self._confirm_cwd()
         except Exception as e:
-            logger.exception(f'Exception setting initial CWD: {e}')
+            logger.error(f'Exception setting initial CWD: {e}')
+            logger.error(traceback.format_exc())
             # Attempt to confirm CWD even if setting threw an exception
             self._confirm_cwd()
         finally:
@@ -942,7 +945,8 @@ class WindowsPowershellSession:
                 )
 
         except Exception as parse_ex:
-            logger.exception(f'Exception during PowerShell command parsing: {parse_ex}')
+            logger.error(f'Exception during PowerShell command parsing: {parse_ex}')
+            logger.error(traceback.format_exc())
             return ErrorObservation(
                 content=f'ERROR: An exception occurred while parsing the command: {parse_ex}'
             )
@@ -1114,9 +1118,10 @@ class WindowsPowershellSession:
                         with self._job_lock:
                             self.active_job = None
                 except AttributeError as e:
-                    logger.exception(
+                    logger.error(
                         f'Get-Job returned an object without expected properties on BaseObject: {e}'
                     )
+                    logger.error(traceback.format_exc())
                     all_errors.append('Get-Job did not return a valid Job object.')
                     job_start_failed = True
 
@@ -1126,7 +1131,8 @@ class WindowsPowershellSession:
                 job_start_failed = True
 
         except Exception as start_ex:
-            logger.exception(f'Exception during job start/retrieval: {start_ex}')
+            logger.error(f'Exception during job start/retrieval: {start_ex}')
+            logger.error(traceback.format_exc())
             all_errors.append(f'[Job Start/Get Exception: {start_ex}]')
             job_start_failed = True
         finally:
@@ -1397,7 +1403,8 @@ class WindowsPowershellSession:
                 self.runspace.Dispose()
                 logger.info('PowerShell runspace closed and disposed.')
             except Exception as e:
-                logger.exception(f'Error closing/disposing PowerShell runspace: {e}')
+                logger.error(f'Error closing/disposing PowerShell runspace: {e}')
+                logger.error(traceback.format_exc())
 
         self.runspace = None
         self._initialized = False

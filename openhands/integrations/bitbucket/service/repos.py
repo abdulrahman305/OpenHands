@@ -13,13 +13,7 @@ class BitBucketReposMixin(BitBucketMixinBase):
     """
 
     async def search_repositories(
-        self,
-        query: str,
-        per_page: int,
-        sort: str,
-        order: str,
-        public: bool,
-        app_mode: AppMode,
+        self, query: str, per_page: int, sort: str, order: str, public: bool
     ) -> list[Repository]:
         """Search for repositories."""
         repositories = []

@@ -30,7 +30,6 @@ class ServerConfig(ServerConfigInterface):
     user_auth_class: str = (
         'openhands.server.user_auth.default_user_auth.DefaultUserAuth'
     )
-    enable_v1: bool = os.getenv('ENABLE_V1') != '0'
 
     def verify_config(self):
         if self.config_cls:

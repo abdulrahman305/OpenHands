@@ -195,11 +195,14 @@ def update_active_working_seconds(
         file_store: The FileStore instance for accessing conversation data
     """
     try:
+        # Get all events for the conversation
+        events = list(event_store.get_events())
+
         # Track agent state changes and calculate running time
         running_start_time = None
         total_running_seconds = 0.0
 
-        for event in event_store.search_events():
+        for event in events:
             if isinstance(event, AgentStateChangedObservation) and event.timestamp:
                 event_timestamp = datetime.fromisoformat(event.timestamp).timestamp()
 

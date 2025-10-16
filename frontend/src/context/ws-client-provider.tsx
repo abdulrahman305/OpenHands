@@ -11,11 +11,13 @@ import {
   CommandAction,
   FileEditAction,
   FileWriteAction,
+  OpenHandsAction,
   UserMessageAction,
 } from "#/types/core/actions";
 import { Conversation } from "#/api/open-hands.types";
 import { useUserProviders } from "#/hooks/use-user-providers";
 import { useActiveConversation } from "#/hooks/query/use-active-conversation";
+import { OpenHandsObservation } from "#/types/core/observations";
 import {
   isAgentStateChangeObservation,
   isErrorObservation,
@@ -26,7 +28,6 @@ import {
 } from "#/types/core/guards";
 import { useErrorMessageStore } from "#/stores/error-message-store";
 import { useOptimisticUserMessageStore } from "#/stores/optimistic-user-message-store";
-import { useEventStore } from "#/stores/use-event-store";
 
 export type WebSocketStatus = "CONNECTING" | "CONNECTED" | "DISCONNECTED";
 
@@ -71,12 +72,16 @@ const isMessageAction = (
 interface UseWsClient {
   webSocketStatus: WebSocketStatus;
   isLoadingMessages: boolean;
+  events: Record<string, unknown>[];
+  parsedEvents: (OpenHandsAction | OpenHandsObservation)[];
   send: (event: Record<string, unknown>) => void;
 }
 
 const WsClientContext = React.createContext<UseWsClient>({
   webSocketStatus: "DISCONNECTED",
   isLoadingMessages: true,
+  events: [],
+  parsedEvents: [],
   send: () => {
     throw new Error("not connected");
   },
@@ -128,11 +133,14 @@ export function WsClientProvider({
 }: React.PropsWithChildren<WsClientProviderProps>) {
   const { setErrorMessage, removeErrorMessage } = useErrorMessageStore();
   const { removeOptimisticUserMessage } = useOptimisticUserMessageStore();
-  const { addEvent, clearEvents } = useEventStore();
   const queryClient = useQueryClient();
   const sioRef = React.useRef<Socket | null>(null);
   const [webSocketStatus, setWebSocketStatus] =
     React.useState<WebSocketStatus>("DISCONNECTED");
+  const [events, setEvents] = React.useState<Record<string, unknown>[]>([]);
+  const [parsedEvents, setParsedEvents] = React.useState<
+    (OpenHandsAction | OpenHandsObservation)[]
+  >([]);
   const lastEventRef = React.useRef<Record<string, unknown> | null>(null);
   const { providers } = useUserProviders();
 
@@ -180,7 +188,7 @@ export function WsClientProvider({
       }
 
       if (isOpenHandsAction(event) || isOpenHandsObservation(event)) {
-        addEvent(event); // Event is already OpenHandsParsedEvent
+        setParsedEvents((prevEvents) => [...prevEvents, event]);
       }
 
       if (isErrorObservation(event)) {
@@ -241,6 +249,7 @@ export function WsClientProvider({
       }
     }
 
+    setEvents((prevEvents) => [...prevEvents, event]);
     if (!Number.isNaN(parseInt(event.id as string, 10))) {
       lastEventRef.current = event;
     }
@@ -277,7 +286,9 @@ export function WsClientProvider({
   React.useEffect(() => {
     lastEventRef.current = null;
 
-    clearEvents();
+    // reset events when conversationId changes
+    setEvents([]);
+    setParsedEvents([]);
     setWebSocketStatus("CONNECTING");
   }, [conversationId]);
 
@@ -386,9 +397,16 @@ export function WsClientProvider({
     () => ({
       webSocketStatus,
       isLoadingMessages: messageRateHandler.isUnderThreshold,
+      events,
+      parsedEvents,
       send,
     }),
-    [webSocketStatus, messageRateHandler.isUnderThreshold],
+    [
+      webSocketStatus,
+      messageRateHandler.isUnderThreshold,
+      events,
+      parsedEvents,
+    ],
   );
 
   return <WsClientContext value={value}>{children}</WsClientContext>;

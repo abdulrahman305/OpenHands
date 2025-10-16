@@ -39,7 +39,7 @@ export function CreateApiKeyModal({
       onKeyCreated(newKey);
       displaySuccessToast(t(I18nKey.SETTINGS$API_KEY_CREATED));
       setNewKeyName("");
-    } catch {
+    } catch (error) {
       displayErrorToast(t(I18nKey.ERROR$GENERIC));
     }
   };

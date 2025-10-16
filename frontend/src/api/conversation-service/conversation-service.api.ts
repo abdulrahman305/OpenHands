@@ -121,7 +121,7 @@ class ConversationService {
         reason?: string;
       }>(url);
       return data;
-    } catch {
+    } catch (error) {
       // Error checking if feedback exists
       return { exists: false };
     }

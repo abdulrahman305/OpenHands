@@ -5,7 +5,6 @@ import { SuggestedTaskGroup } from "#/utils/types";
 import { ConversationStatus } from "#/types/conversation-status";
 import { GitRepository } from "#/types/git";
 import { sanitizeQuery } from "#/utils/sanitize-query";
-import { PRODUCT_URL } from "#/utils/constants";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -49,13 +48,6 @@ export const isMobileDevice = (): boolean =>
   ) ||
   "ontouchstart" in window ||
   navigator.maxTouchPoints > 0;
-
-/**
- * Checks if the current domain is the production domain
- * @returns True if the current domain matches the production URL
- */
-export const isProductionDomain = (): boolean =>
-  window.location.origin === PRODUCT_URL.PRODUCTION;
 
 interface EventActionHistory {
   args?: {

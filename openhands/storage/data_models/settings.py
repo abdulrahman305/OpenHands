@@ -10,6 +10,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json import pydantic_encoder
 
 from openhands.core.config.llm_config import LLMConfig
 from openhands.core.config.mcp_config import MCPConfig
@@ -71,7 +72,7 @@ class Settings(BaseModel):
         if context and context.get('expose_secrets', False):
             return secret_value
 
-        return str(api_key)
+        return pydantic_encoder(api_key)
 
     @model_validator(mode='before')
     @classmethod

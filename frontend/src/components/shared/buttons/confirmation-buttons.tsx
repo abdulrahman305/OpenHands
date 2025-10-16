@@ -5,13 +5,11 @@ import { AgentState } from "#/types/agent-state";
 import { generateAgentStateChangeEvent } from "#/services/agent-state-service";
 import { useWsClient } from "#/context/ws-client-provider";
 import { ActionTooltip } from "../action-tooltip";
-import { isOpenHandsAction, isActionOrObservation } from "#/types/core/guards";
+import { isOpenHandsAction } from "#/types/core/guards";
 import { ActionSecurityRisk } from "#/stores/security-analyzer-store";
 import { RiskAlert } from "#/components/shared/risk-alert";
 import WarningIcon from "#/icons/u-warning.svg?react";
 import { useEventMessageStore } from "#/stores/event-message-store";
-import { useEventStore } from "#/stores/use-event-store";
-import { isV0Event } from "#/types/v1/type-guards";
 
 export function ConfirmationButtons() {
   const submittedEventIds = useEventMessageStore(
@@ -23,13 +21,10 @@ export function ConfirmationButtons() {
 
   const { t } = useTranslation();
 
-  const { send } = useWsClient();
-  const events = useEventStore((state) => state.events);
+  const { send, parsedEvents } = useWsClient();
 
   // Find the most recent action awaiting confirmation
-  const awaitingAction = events
-    .filter(isV0Event)
-    .filter(isActionOrObservation)
+  const awaitingAction = parsedEvents
     .slice()
     .reverse()
     .find((ev) => {

@@ -90,7 +90,7 @@ export function ConversationCard({
           }
         }
         // VS Code URL not available
-      } catch {
+      } catch (error) {
         // Failed to fetch VS Code URL
       }
     }

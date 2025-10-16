@@ -11,6 +11,7 @@ import { useAgentStore } from "#/stores/agent-store";
 import { AgentState } from "#/types/agent-state";
 
 import { useBatchFeedback } from "#/hooks/query/use-batch-feedback";
+import { WsClientProvider } from "#/context/ws-client-provider";
 import { EventHandler } from "../wrapper/event-handler";
 import { useConversationConfig } from "#/hooks/query/use-conversation-config";
 
@@ -27,7 +28,6 @@ import { ConversationName } from "#/components/features/conversation/conversatio
 
 import { ConversationTabs } from "#/components/features/conversation/conversation-tabs/conversation-tabs";
 import { useStartConversation } from "#/hooks/mutation/use-start-conversation";
-import { WebSocketProviderWrapper } from "#/contexts/websocket-provider-wrapper";
 
 function AppContent() {
   useConversationConfig();
@@ -106,7 +106,7 @@ function AppContent() {
   });
 
   return (
-    <WebSocketProviderWrapper version={0} conversationId={conversationId}>
+    <WsClientProvider conversationId={conversationId}>
       <ConversationSubscriptionsProvider>
         <EventHandler>
           <div
@@ -122,7 +122,7 @@ function AppContent() {
           </div>
         </EventHandler>
       </ConversationSubscriptionsProvider>
-    </WebSocketProviderWrapper>
+    </WsClientProvider>
   );
 }
 

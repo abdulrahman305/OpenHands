@@ -148,7 +148,7 @@ async def search_repositories(
         )
         try:
             repos: list[Repository] = await client.search_repositories(
-                selected_provider, query, per_page, sort, order, server_config.app_mode
+                selected_provider, query, per_page, sort, order
             )
             return repos
 

@@ -117,8 +117,9 @@ export function GitRepoDropdown({
   const prioritizeRecentRepositories = useCallback(
     (repoList: GitRepository[]) => {
       const recentRepoIds = new Set(recentRepositories.map((repo) => repo.id));
+      const recentRepos = repoList.filter((repo) => recentRepoIds.has(repo.id));
       const otherRepos = repoList.filter((repo) => !recentRepoIds.has(repo.id));
-      return [...recentRepositories, ...otherRepos];
+      return [...recentRepos, ...otherRepos];
     },
     [recentRepositories],
   );
